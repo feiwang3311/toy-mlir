@@ -561,9 +561,7 @@ public:
   SmallVector<PatternMatch> findMatches(ModuleOp module) {
     SmallVector<PatternMatch> matches;
 
-    llvm::errs() << "[PatternMatcher] Searching for pattern matches...\n";
-    llvm::errs() << "[PatternMatcher] Pattern has " << patternOps.size()
-                 << " operations to match\n";
+    llvm::errs() << "[PatternMatcher] Searching for matches...\n";
 
     // Walk all operations in the module
     module.walk([&](Operation *op) {
@@ -581,7 +579,6 @@ public:
       }
     });
 
-    llvm::errs() << "[PatternMatcher] Found " << matches.size() << " total matches\n";
     return matches;
   }
 
@@ -639,7 +636,8 @@ private:
     return true;
   }
 
-  // Match a sequence of operations starting from index
+  // Match all pattern operations starting from a candidate operation
+  // This handles DAG patterns by matching based on data dependencies
   bool matchSequence(Operation *startOp, size_t patternIndex) {
     if (patternIndex >= patternOps.size()) {
       // Successfully matched all pattern operations
@@ -648,11 +646,10 @@ private:
 
     Operation *patternOp = patternOps[patternIndex];
 
-    llvm::errs() << "[matchSequence] Matching pattern op " << patternIndex
-                 << " (" << patternOp->getName() << ") starting from "
-                 << startOp->getName() << " at " << startOp->getLoc() << "\n";
+    llvm::errs() << "[matchDAG] Matching pattern op " << patternIndex
+                 << " (" << patternOp->getName() << ")\n";
 
-    // Try to match the current pattern operation with startOp
+    // Try to match this pattern operation with startOp
     if (!matchOp(patternOp, startOp)) {
       return false;
     }
@@ -665,21 +662,70 @@ private:
       bindings[patternOp->getResult(0)] = startOp->getResult(0);
     }
 
-    // For now, just try the next operation in sequence
-    // This is a simplified linear match - we'll enhance this later for DAGs
-    Operation *nextOp = startOp->getNextNode();
-    if (!nextOp) {
-      llvm::errs() << "[matchSequence] ✗ No next operation\n";
-      matchedOps.pop_back();
-      return false;
-    }
-
-    if (matchSequence(nextOp, patternIndex + 1)) {
+    // Try to match remaining pattern operations
+    // Search for them based on data dependencies, not sequential order
+    if (matchRemainingOps(patternIndex + 1)) {
       return true;
     }
 
     // Backtrack
     matchedOps.pop_back();
+    return false;
+  }
+
+  // Match remaining pattern operations by searching the IR based on data flow
+  bool matchRemainingOps(size_t startIndex) {
+    if (startIndex >= patternOps.size()) {
+      return true;  // All matched
+    }
+
+    Operation *patternOp = patternOps[startIndex];
+
+    llvm::errs() << "[matchRemaining] Looking for pattern op " << startIndex
+                 << " (" << patternOp->getName() << ")\n";
+
+    // Find candidate operations in the IR that could match this pattern op
+    // Strategy: look for operations that:
+    // 1. Have the same name
+    // 2. Are in the same block as already matched ops
+    // 3. Use values we've already bound
+
+    Block *searchBlock = matchedOps.empty() ? nullptr : matchedOps[0]->getBlock();
+
+    if (!searchBlock) {
+      llvm::errs() << "[matchRemaining] ✗ No search block\n";
+      return false;
+    }
+
+    // Search the block for matching operation
+    for (auto &candidateOp : searchBlock->getOperations()) {
+      // Skip if already matched
+      if (std::find(matchedOps.begin(), matchedOps.end(), &candidateOp) != matchedOps.end()) {
+        continue;
+      }
+
+      // Try to match this candidate
+      if (matchOp(patternOp, &candidateOp)) {
+        matchedOps.push_back(&candidateOp);
+
+        // Bind results
+        if (patternOp->getNumResults() == 1 && candidateOp.getNumResults() == 1) {
+          bindings[patternOp->getResult(0)] = candidateOp.getResult(0);
+        }
+
+        // Recursively match remaining operations
+        if (matchRemainingOps(startIndex + 1)) {
+          return true;
+        }
+
+        // Backtrack
+        matchedOps.pop_back();
+        // Note: bindings are not removed here, which is OK because we'll clear
+        // them when we try a new match from scratch
+      }
+    }
+
+    llvm::errs() << "[matchRemaining] ✗ Could not find match for pattern op " << startIndex << "\n";
     return false;
   }
 };
