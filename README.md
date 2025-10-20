@@ -97,7 +97,7 @@ Implements SSA value binding algorithm to find pattern matches in IR.
 **📖 For a detailed deep-dive explanation of this part, see [PATTERN_MATCHING_EXPLAINED.md](PATTERN_MATCHING_EXPLAINED.md)**
 
 **Key Features:**
-- **SSA Value Binding:** Pattern values consistently map to IR values
+- **SSA Value Binding:** Pattern values consistently map to IR values (supports multi-result operations)
 - **DAG Pattern Support:** Handles values used multiple times (not just linear chains)
 - **Call Prefix Matching:** Pattern `@foo` matches `@foo_0`, `@foo_1`, etc.
 - **Backtracking Search:** Finds all non-overlapping matches
@@ -106,7 +106,7 @@ Implements SSA value binding algorithm to find pattern matches in IR.
 1. Walk all operations in the module
 2. For each operation, try to match the first pattern operation
 3. Use data-flow based search to match remaining operations
-4. Bind SSA values consistently (same pattern value → same IR value)
+4. Bind SSA values consistently (same pattern value → same IR value, handles multiple results)
 5. Backtrack if constraints violated
 
 ### PART 3: Function Transformations

@@ -663,9 +663,12 @@ private:
     // Add to matched operations
     matchedOps.push_back(startOp);
 
-    // Bind pattern result to IR result
-    if (patternOp->getNumResults() == 1 && startOp->getNumResults() == 1) {
-      bindings[patternOp->getResult(0)] = startOp->getResult(0);
+    // Bind pattern results to IR results (handle multiple results)
+    if (patternOp->getNumResults() == startOp->getNumResults()) {
+      for (auto [patternResult, irResult] :
+           llvm::zip(patternOp->getResults(), startOp->getResults())) {
+        bindings[patternResult] = irResult;
+      }
     }
 
     // Try to match remaining pattern operations
@@ -702,9 +705,12 @@ private:
       if (matchOp(patternOp, &candidateOp)) {
         matchedOps.push_back(&candidateOp);
 
-        // Bind results
-        if (patternOp->getNumResults() == 1 && candidateOp.getNumResults() == 1) {
-          bindings[patternOp->getResult(0)] = candidateOp.getResult(0);
+        // Bind results (handle multiple results)
+        if (patternOp->getNumResults() == candidateOp.getNumResults()) {
+          for (auto [patternResult, irResult] :
+               llvm::zip(patternOp->getResults(), candidateOp.getResults())) {
+            bindings[patternResult] = irResult;
+          }
         }
 
         // Recursively match remaining operations

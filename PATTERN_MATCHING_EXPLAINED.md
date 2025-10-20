@@ -283,9 +283,12 @@ bool matchSequence(Operation *startOp, size_t patternIndex) {
   // Add to matched operations
   matchedOps.push_back(startOp);
 
-  // Bind pattern result to IR result
-  if (patternOp->getNumResults() == 1 && startOp->getNumResults() == 1) {
-    bindings[patternOp->getResult(0)] = startOp->getResult(0);
+  // Bind pattern results to IR results (handle multiple results)
+  if (patternOp->getNumResults() == startOp->getNumResults()) {
+    for (auto [patternResult, irResult] :
+         llvm::zip(patternOp->getResults(), startOp->getResults())) {
+      bindings[patternResult] = irResult;
+    }
   }
 
   // Try to match remaining pattern operations
@@ -301,7 +304,9 @@ bool matchSequence(Operation *startOp, size_t patternIndex) {
 
 **Key Points**:
 - Matches the first pattern operation with `startOp`
-- Records the result binding (critical for DAG matching!)
+- Records the result bindings for **all results** (handles multi-result operations!)
+- Critical for DAG matching where results are used by multiple operations
+- Uses `llvm::zip` to bind all results in order
 - Delegates to `matchRemainingOps()` for the rest
 
 #### Phase 2: `matchRemainingOps()` - DAG Search
@@ -330,9 +335,12 @@ bool matchRemainingOps(size_t startIndex) {
     if (matchOp(patternOp, &candidateOp)) {
       matchedOps.push_back(&candidateOp);
 
-      // Bind results
-      if (patternOp->getNumResults() == 1 && candidateOp.getNumResults() == 1) {
-        bindings[patternOp->getResult(0)] = candidateOp.getResult(0);
+      // Bind results (handle multiple results)
+      if (patternOp->getNumResults() == candidateOp.getNumResults()) {
+        for (auto [patternResult, irResult] :
+             llvm::zip(patternOp->getResults(), candidateOp.getResults())) {
+          bindings[patternResult] = irResult;
+        }
       }
 
       // Recursively match remaining operations
@@ -683,13 +691,16 @@ pattern_%2    → ir_%4
 
 ### Pitfall 1: Forgetting to Bind Results
 ```cpp
-// WRONG: Forget to bind result
+// WRONG: Forget to bind results
 matchedOps.push_back(startOp);
 // Pattern uses %0 as operand later, but it's not bound!
 
-// RIGHT: Always bind results
-if (patternOp->getNumResults() == 1 && startOp->getNumResults() == 1) {
-  bindings[patternOp->getResult(0)] = startOp->getResult(0);
+// RIGHT: Always bind results (handle multiple results)
+if (patternOp->getNumResults() == startOp->getNumResults()) {
+  for (auto [patternResult, irResult] :
+       llvm::zip(patternOp->getResults(), startOp->getResults())) {
+    bindings[patternResult] = irResult;
+  }
 }
 ```
 
