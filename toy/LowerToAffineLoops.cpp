@@ -32,6 +32,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Sequence.h"
@@ -317,6 +318,100 @@ struct TransposeOpLowering : public ConversionPattern {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// ToyToAffine RewritePatterns: TransposeMul optimization
+//===----------------------------------------------------------------------===//
+
+/// Pattern to match a toy.transpose followed by toy.mul with the same operand
+struct TransposeMulPattern : public OpRewritePattern<toy::MulOp> {
+  using OpRewritePattern<toy::MulOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(toy::MulOp mulOp, PatternRewriter &rewriter) const override {
+    llvm::errs() << "[TransposeMulPattern] Checking MulOp at " << mulOp.getLoc() << "\n";
+
+    // Check if both operands of mul are the same
+    if (mulOp.getLhs() != mulOp.getRhs()) {
+      llvm::errs() << "[TransposeMulPattern] Operands are different - skipping\n";
+      return failure();
+    }
+    llvm::errs() << "[TransposeMulPattern] Both operands are the same!\n";
+
+    // Check if the operand is a transpose operation
+    auto transposeOp = mulOp.getLhs().getDefiningOp<toy::TransposeOp>();
+    if (!transposeOp) {
+      llvm::errs() << "[TransposeMulPattern] Operand is not a transpose - skipping\n";
+      return failure();
+    }
+    llvm::errs() << "[TransposeMulPattern] Operand is a transpose! Pattern matches!\n";
+
+    // Get the module operation
+    ModuleOp moduleOp = mulOp->getParentOfType<ModuleOp>();
+    if (!moduleOp) {
+      llvm::errs() << "[TransposeMulPattern] Cannot find module - skipping\n";
+      return failure();
+    }
+
+    // Create a new function name
+    std::string funcName = "transpose_mul_opt";
+
+    // Check if the function already exists in the module
+    toy::FuncOp existingFunc = moduleOp.lookupSymbol<toy::FuncOp>(funcName);
+    if (!existingFunc) {
+      llvm::errs() << "[TransposeMulPattern] Creating new function: " << funcName << "\n";
+      // Save the current insertion point
+      OpBuilder::InsertionGuard guard(rewriter);
+
+      // Set insertion point to the end of the module to insert the new function
+      rewriter.setInsertionPointToEnd(moduleOp.getBody());
+
+      // Create the function type (takes one tensor, returns one tensor)
+      auto inputType = transposeOp.getInput().getType();
+      FunctionType funcType = rewriter.getFunctionType({inputType}, {inputType});
+
+      // Create the function
+      existingFunc = rewriter.create<toy::FuncOp>(mulOp.getLoc(), funcName, funcType);
+      existingFunc.setPrivate();
+
+      // Get or create the function body
+      Block *block;
+      if (existingFunc.getBody().empty()) {
+        block = existingFunc.addEntryBlock();
+      } else {
+        block = &existingFunc.getBody().front();
+      }
+      rewriter.setInsertionPointToStart(block);
+
+      // Add the transpose and mul operations
+      auto arg = existingFunc.getArgument(0);
+      auto newTranspose = rewriter.create<toy::TransposeOp>(mulOp.getLoc(), arg);
+      auto newMul = rewriter.create<toy::MulOp>(mulOp.getLoc(), newTranspose.getResult(), newTranspose.getResult());
+
+      // Add the return operation
+      rewriter.create<toy::ReturnOp>(mulOp.getLoc(), newMul.getResult());
+      llvm::errs() << "[TransposeMulPattern] Function created successfully!\n";
+    } else {
+      llvm::errs() << "[TransposeMulPattern] Function already exists, reusing it\n";
+    }
+
+    // Replace the original mul operation with a call to the new function
+    llvm::errs() << "[TransposeMulPattern] Creating GenericCallOp to " << funcName << "\n";
+    SmallVector<Value, 1> callOperands;
+    callOperands.push_back(transposeOp.getInput());
+    auto callOp = rewriter.create<toy::GenericCallOp>(
+        mulOp.getLoc(),
+        mulOp.getType(),
+        mlir::SymbolRefAttr::get(rewriter.getContext(), funcName),
+        callOperands);
+
+    // Replace the mul operation with the call result
+    llvm::errs() << "[TransposeMulPattern] Replacing MulOp with call\n";
+    rewriter.replaceOp(mulOp, callOp.getResult());
+
+    llvm::errs() << "[TransposeMulPattern] Pattern applied successfully!\n";
+    return success();
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -340,6 +435,17 @@ struct ToyToAffineLoweringPass
 } // namespace
 
 void ToyToAffineLoweringPass::runOnOperation() {
+  // First, apply the TransposeMulPattern as a greedy rewrite
+  // This runs before the conversion framework, so it works on legal ops
+  llvm::errs() << "[LowerToAffine] Running TransposeMulPattern first...\n";
+  RewritePatternSet patterns(&getContext());
+  patterns.add<TransposeMulPattern>(&getContext());
+  if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
+    llvm::errs() << "[LowerToAffine] Greedy rewrite failed\n";
+  } else {
+    llvm::errs() << "[LowerToAffine] Greedy rewrite completed\n";
+  }
+
   // The first thing to define is the conversion target. This will define the
   // final target for this lowering.
   ConversionTarget target(getContext());
@@ -363,18 +469,24 @@ void ToyToAffineLoweringPass::runOnOperation() {
                          [](Type type) { return llvm::isa<TensorType>(type); });
   });
 
+  // Mark operations as legal to test TransposeMulPattern in isolation
+  target.addLegalOp<toy::AddOp, toy::ConstantOp, toy::TransposeOp, toy::MulOp, toy::PrintOp>();
+  target.addLegalOp<toy::FuncOp, toy::ReturnOp>(); // Keep toy functions and returns as-is
+  target.addLegalOp<toy::GenericCallOp>(); // Allow the generated call
+
   // Now that the conversion target has been defined, we just need to provide
   // the set of patterns that will lower the Toy operations.
-  RewritePatternSet patterns(&getContext());
-  patterns.add<AddOpLowering, ConstantOpLowering, FuncOpLowering, MulOpLowering,
-               PrintOpLowering, ReturnOpLowering, TransposeOpLowering>(
-      &getContext());
+  RewritePatternSet conversionPatterns(&getContext());
+  // Only keep PrintOpLowering to update operands from tensor to memref
+  // All other toy ops are marked legal for testing TransposeMulPattern in isolation
+  // Note: TransposeMulPattern is applied separately as a greedy rewrite above
+  conversionPatterns.add<PrintOpLowering>(&getContext());
 
   // With the target and rewrite patterns defined, we can now attempt the
   // conversion. The conversion will signal failure if any of our `illegal`
   // operations were not converted successfully.
   if (failed(
-          applyPartialConversion(getOperation(), target, std::move(patterns))))
+          applyPartialConversion(getOperation(), target, std::move(conversionPatterns))))
     signalPassFailure();
 }
 
