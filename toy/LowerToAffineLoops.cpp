@@ -616,6 +616,47 @@ private:
       return false;
     }
 
+    // Special handling for toy.generic_call: match by callee prefix
+    if (auto patternCall = dyn_cast<toy::GenericCallOp>(patternOp)) {
+      if (auto irCall = dyn_cast<toy::GenericCallOp>(irOp)) {
+        StringRef patternCallee = patternCall.getCallee();
+        StringRef irCallee = irCall.getCallee();
+
+        llvm::errs() << "  [matchOp] Matching call: pattern callee='" << patternCallee
+                     << "' vs IR callee='" << irCallee << "'\n";
+
+        // Remove _N suffix from IR callee (e.g., "transpose_mul_0" -> "transpose_mul")
+        // Split on last '_' and check if suffix is a number
+        auto splitResult = irCallee.rsplit('_');
+        StringRef irCalleePrefix = splitResult.first;
+        StringRef suffix = splitResult.second;
+
+        // Only strip suffix if it's actually a number
+        bool hasSuffix = !suffix.empty() &&
+                         std::all_of(suffix.begin(), suffix.end(),
+                                   [](char c) { return std::isdigit(c); });
+
+        if (hasSuffix) {
+          llvm::errs() << "  [matchOp] IR callee has numeric suffix, using prefix: '"
+                       << irCalleePrefix << "'\n";
+          // Check if IR callee prefix matches pattern callee exactly
+          if (irCalleePrefix != patternCallee) {
+            llvm::errs() << "  [matchOp] ✗ Callee prefix doesn't match\n";
+            return false;
+          }
+        } else {
+          // No numeric suffix, require exact match
+          if (irCallee != patternCallee) {
+            llvm::errs() << "  [matchOp] ✗ Callee doesn't match (no suffix)\n";
+            return false;
+          }
+        }
+
+        llvm::errs() << "  [matchOp] ✓ Callee matched!\n";
+        // Continue to match operands below
+      }
+    }
+
     // Match operand count
     if (patternOp->getNumOperands() != irOp->getNumOperands()) {
       llvm::errs() << "  [matchOp] ✗ Operand counts don't match ("
@@ -873,6 +914,136 @@ public:
 
     llvm::errs() << "[FunctionExtractor] Extraction complete!\n";
   }
+
+  // Inline all toy.generic_call operations within a function
+  void inlineCalledFunctions(toy::FuncOp func, ModuleOp module) {
+    llvm::errs() << "\n[FunctionInliner] Starting inlining for function: " << func.getName() << "\n";
+
+    // Keep inlining until no more calls remain
+    bool changed = true;
+    int iteration = 0;
+    while (changed) {
+      changed = false;
+      iteration++;
+      llvm::errs() << "[FunctionInliner] Iteration " << iteration << "\n";
+
+      // Find all generic_call operations
+      SmallVector<toy::GenericCallOp> callsToInline;
+      func.walk([&](toy::GenericCallOp callOp) {
+        callsToInline.push_back(callOp);
+      });
+
+      llvm::errs() << "[FunctionInliner] Found " << callsToInline.size() << " calls to inline\n";
+
+      for (auto callOp : callsToInline) {
+        StringRef callee = callOp.getCallee();
+        llvm::errs() << "[FunctionInliner] Inlining call to: " << callee << "\n";
+
+        // Find the called function in the module
+        auto calledFunc = module.lookupSymbol<toy::FuncOp>(callee);
+        if (!calledFunc) {
+          llvm::errs() << "[FunctionInliner] ✗ Function not found: " << callee << "\n";
+          continue;
+        }
+
+        llvm::errs() << "[FunctionInliner] ✓ Found function to inline\n";
+
+        // Create builder at call site
+        OpBuilder builder(callOp);
+        IRMapping mapping;
+
+        // Map function arguments to call operands
+        for (auto [arg, operand] : llvm::zip(
+               calledFunc.getArguments(), callOp.getOperands())) {
+          mapping.map(arg, operand);
+          llvm::errs() << "[FunctionInliner] Mapped argument to operand\n";
+        }
+
+        // Clone all operations from function body (except return)
+        Value inlinedResult;
+        Block &calledBody = calledFunc.getBody().front();
+
+        llvm::errs() << "[FunctionInliner] Cloning "
+                     << calledBody.getOperations().size() << " operations\n";
+
+        for (Operation &op : calledBody.getOperations()) {
+          if (auto returnOp = dyn_cast<toy::ReturnOp>(&op)) {
+            // Get the returned value (will replace call result)
+            if (returnOp.getNumOperands() > 0) {
+              inlinedResult = mapping.lookup(returnOp.getOperand(0));
+              llvm::errs() << "[FunctionInliner] Found return value\n";
+            }
+          } else {
+            // Clone the operation
+            Operation *cloned = builder.clone(op, mapping);
+            llvm::errs() << "[FunctionInliner] Cloned: " << cloned->getName() << "\n";
+          }
+        }
+
+        // Replace call with inlined result
+        if (inlinedResult) {
+          callOp.getResult().replaceAllUsesWith(inlinedResult);
+          llvm::errs() << "[FunctionInliner] Replaced call result with inlined value\n";
+        }
+
+        // Erase the call
+        callOp.erase();
+        llvm::errs() << "[FunctionInliner] Erased call operation\n";
+
+        changed = true;
+      }
+    }
+
+    llvm::errs() << "[FunctionInliner] Inlining complete after " << iteration << " iterations\n";
+  }
+
+  // Remove dead (unused) functions from the module
+  // Keeps main function and any functions that are called
+  static void removeDeadFunctions(ModuleOp module) {
+    llvm::errs() << "\n[DeadFunctionElimination] Starting dead function elimination\n";
+
+    // Collect all function calls in the module
+    DenseSet<StringRef> calledFunctions;
+    module.walk([&](toy::GenericCallOp callOp) {
+      calledFunctions.insert(callOp.getCallee());
+      llvm::errs() << "[DeadFunctionElimination] Function is called: " << callOp.getCallee() << "\n";
+    });
+
+    // Find functions to remove (private functions that are never called)
+    SmallVector<toy::FuncOp> toErase;
+    module.walk([&](toy::FuncOp func) {
+      StringRef funcName = func.getName();
+
+      // Keep main function
+      if (funcName == "main") {
+        llvm::errs() << "[DeadFunctionElimination] Keeping main function\n";
+        return;
+      }
+
+      // Keep public functions
+      if (!func.isPrivate()) {
+        llvm::errs() << "[DeadFunctionElimination] Keeping public function: " << funcName << "\n";
+        return;
+      }
+
+      // Check if function is called
+      if (!calledFunctions.contains(funcName)) {
+        llvm::errs() << "[DeadFunctionElimination] ✗ Marking for removal: " << funcName << " (unused)\n";
+        toErase.push_back(func);
+      } else {
+        llvm::errs() << "[DeadFunctionElimination] ✓ Keeping function: " << funcName << " (used)\n";
+      }
+    });
+
+    // Remove dead functions
+    llvm::errs() << "[DeadFunctionElimination] Removing " << toErase.size() << " dead functions\n";
+    for (auto func : toErase) {
+      llvm::errs() << "[DeadFunctionElimination] Erasing function: " << func.getName() << "\n";
+      func.erase();
+    }
+
+    llvm::errs() << "[DeadFunctionElimination] Complete!\n";
+  }
 };
 
 } // namespace
@@ -903,7 +1074,8 @@ void ToyToAffineLoweringPass::runOnOperation() {
     {"transpose_mul", "patterns/transpose_mul.mlir"},
     {"transpose_dag", "patterns/transpose_dag.mlir"},
     {"double_transpose", "patterns/double_transpose.mlir"},
-    {"add_mul_chain", "patterns/add_mul_chain.mlir"}
+    {"add_mul_chain", "patterns/add_mul_chain.mlir"},
+    {"transpose_mul_add", "patterns/transpose_mul_add.mlir"}
   };
 
   llvm::errs() << "\n========== TESTING MULTIPLE PATTERNS ==========\n";
@@ -954,10 +1126,23 @@ void ToyToAffineLoweringPass::runOnOperation() {
         FunctionExtractor extractor;
         OpBuilder builder(&getContext());
 
+        SmallVector<toy::FuncOp> extractedFuncs;
         for (size_t i = 0; i < matches.size(); ++i) {
           std::string funcName = patternInfo.name + "_" + std::to_string(i);
           extractor.extractAndReplace(matches[i], patternInfo, funcName,
                                        getOperation(), builder);
+
+          // Find the newly created function
+          auto newFunc = getOperation().lookupSymbol<toy::FuncOp>(funcName);
+          if (newFunc) {
+            extractedFuncs.push_back(newFunc);
+          }
+        }
+
+        // ========== Inline called functions ==========
+        llvm::errs() << "\n--- Inlining called functions ---\n";
+        for (auto func : extractedFuncs) {
+          extractor.inlineCalledFunctions(func, getOperation());
         }
       } else {
         llvm::errs() << "[LowerToAffine] ✗ No matches found for " << patternName << "\n";
@@ -968,6 +1153,11 @@ void ToyToAffineLoweringPass::runOnOperation() {
   }
 
   llvm::errs() << "============ ALL PATTERNS TESTED ============\n\n";
+
+  // ========== Dead Function Elimination ==========
+  llvm::errs() << "========== Dead Function Elimination ==========\n";
+  FunctionExtractor::removeDeadFunctions(getOperation());
+  llvm::errs() << "================================================\n\n";
 
   // COMMENTED OUT: Old TransposeMulPattern - testing new pattern matcher instead
   // // First, apply the TransposeMulPattern as a greedy rewrite
