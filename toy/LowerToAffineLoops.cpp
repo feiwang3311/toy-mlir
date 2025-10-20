@@ -419,7 +419,17 @@ struct TransposeMulPattern : public OpRewritePattern<toy::MulOp> {
 } // namespace
 
 //===----------------------------------------------------------------------===//
-// Pattern File Parsing Infrastructure
+//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+//
+//                    PART 1: PATTERN LOADING
+//
+// This section handles parsing pattern files (MLIR snippets) and extracting
+// pattern information. Patterns are defined as toy.func operations in
+// separate .mlir files.
+//
+//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -433,32 +443,21 @@ struct PatternInfo {
   OwningOpRef<ModuleOp> patternModule;      // Keep the parsed module alive
 
   void dump() const {
-    llvm::errs() << "=== Pattern: " << name << " ===\n";
-    llvm::errs() << "Operations (" << operationNames.size() << "):\n";
-    for (const auto &opName : operationNames) {
-      llvm::errs() << "  " << opName << "\n";
-    }
-    llvm::errs() << "Inputs: " << numInputs << "\n";
-    llvm::errs() << "Outputs: " << numOutputs << "\n";
-    llvm::errs() << "===================\n";
+    llvm::errs() << "Pattern '" << name << "': " << operationNames.size()
+                 << " ops, " << numInputs << " inputs, " << numOutputs << " outputs\n";
   }
 };
 
 // Parse a pattern file and extract pattern information
 LogicalResult parsePatternFile(StringRef filePath, MLIRContext *context,
                                PatternInfo &patternInfo) {
-  llvm::errs() << "[PatternParser] Reading pattern file: " << filePath << "\n";
-
   // Read the pattern file
   auto fileOrErr = llvm::MemoryBuffer::getFile(filePath);
   if (!fileOrErr) {
-    llvm::errs() << "[PatternParser] ERROR: Could not read file: "
+    llvm::errs() << "ERROR: Could not read pattern file: "
                  << fileOrErr.getError().message() << "\n";
     return failure();
   }
-
-  llvm::errs() << "[PatternParser] File contents:\n"
-               << fileOrErr.get()->getBuffer() << "\n";
 
   // Parse the MLIR snippet as a module
   llvm::SourceMgr sourceMgr;
@@ -466,11 +465,9 @@ LogicalResult parsePatternFile(StringRef filePath, MLIRContext *context,
 
   patternInfo.patternModule = parseSourceFile<ModuleOp>(sourceMgr, context);
   if (!patternInfo.patternModule) {
-    llvm::errs() << "[PatternParser] ERROR: Failed to parse pattern file as module\n";
+    llvm::errs() << "ERROR: Failed to parse pattern file\n";
     return failure();
   }
-
-  llvm::errs() << "[PatternParser] Successfully parsed module\n";
 
   // Find the pattern function
   toy::FuncOp patternFunc = nullptr;
@@ -481,50 +478,52 @@ LogicalResult parsePatternFile(StringRef filePath, MLIRContext *context,
   });
 
   if (!patternFunc) {
-    llvm::errs() << "[PatternParser] ERROR: No toy.func @pattern found\n";
+    llvm::errs() << "ERROR: No toy.func @pattern found\n";
     return failure();
   }
 
-  llvm::errs() << "[PatternParser] Found pattern function with "
-               << patternFunc.getNumArguments() << " arguments\n";
-
   // Get the function body
   Block *patternBlock = &patternFunc.getBody().front();
-
-  llvm::errs() << "[PatternParser] Function body has "
-               << patternBlock->getOperations().size() << " operations\n";
 
   // Extract operation names (except return)
   Operation *returnOp = nullptr;
   for (auto &op : patternBlock->getOperations()) {
     if (isa<func::ReturnOp>(&op) || isa<toy::ReturnOp>(&op)) {
       returnOp = &op;
-      llvm::errs() << "[PatternParser] Found return op\n";
     } else {
       patternInfo.operationNames.push_back(op.getName().getStringRef().str());
-      llvm::errs() << "[PatternParser] Added operation: " << op.getName() << "\n";
     }
   }
 
   if (!returnOp) {
-    llvm::errs() << "[PatternParser] ERROR: No return operation found\n";
+    llvm::errs() << "ERROR: No return operation found\n";
     return failure();
   }
 
   // Count outputs from return operands
   patternInfo.numOutputs = returnOp->getNumOperands();
-  llvm::errs() << "[PatternParser] Outputs: " << patternInfo.numOutputs << "\n";
 
   // Count inputs: function arguments
   patternInfo.numInputs = patternFunc.getNumArguments();
-  llvm::errs() << "[PatternParser] Inputs: " << patternInfo.numInputs << "\n";
 
-  llvm::errs() << "[PatternParser] Pattern parsing complete!\n";
   return success();
 }
 
 //===----------------------------------------------------------------------===//
-// Pattern Matching Infrastructure
+//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+//
+//                    PART 2: PATTERN MATCHING
+//
+// This section implements the pattern matching algorithm. It uses SSA value
+// binding to match patterns in the IR, supporting both linear and DAG patterns.
+// Features:
+// - SSA value binding (pattern values map to IR values consistently)
+// - DAG pattern matching (values can be used multiple times)
+// - Call prefix matching (pattern @foo matches IR @foo_0, @foo_1, etc.)
+//
+//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 //===----------------------------------------------------------------------===//
 
 // Structure to hold a single pattern match result
@@ -561,8 +560,6 @@ public:
   SmallVector<PatternMatch> findMatches(ModuleOp module) {
     SmallVector<PatternMatch> matches;
 
-    llvm::errs() << "[PatternMatcher] Searching for matches...\n";
-
     // Walk all operations in the module
     module.walk([&](Operation *op) {
       // Try to match starting from this operation
@@ -570,8 +567,6 @@ public:
       matchedOps.clear();
 
       if (matchSequence(op, 0)) {
-        llvm::errs() << "[PatternMatcher] ✓ Found match at " << op->getLoc() << "\n";
-
         PatternMatch match(op->getLoc());
         match.matchedOps = matchedOps;
         match.valueBindings = bindings;
@@ -592,27 +587,18 @@ private:
   bool matchValue(Value patternVal, Value irVal) {
     // Check if this pattern value is already bound
     if (bindings.count(patternVal)) {
-      bool matches = (bindings[patternVal] == irVal);
-      if (!matches) {
-        llvm::errs() << "  [matchValue] ✗ Binding conflict: pattern value already bound to different IR value\n";
-      }
-      return matches;
+      return bindings[patternVal] == irVal;
     }
 
     // First time seeing this pattern value - bind it
     bindings[patternVal] = irVal;
-    llvm::errs() << "  [matchValue] ✓ Bound pattern value to IR value\n";
     return true;
   }
 
   // Match a single operation
   bool matchOp(Operation *patternOp, Operation *irOp) {
-    llvm::errs() << "  [matchOp] Trying to match " << patternOp->getName()
-                 << " with " << irOp->getName() << "\n";
-
     // Match operation name (ignore types)
     if (patternOp->getName() != irOp->getName()) {
-      llvm::errs() << "  [matchOp] ✗ Operation names don't match\n";
       return false;
     }
 
@@ -622,11 +608,7 @@ private:
         StringRef patternCallee = patternCall.getCallee();
         StringRef irCallee = irCall.getCallee();
 
-        llvm::errs() << "  [matchOp] Matching call: pattern callee='" << patternCallee
-                     << "' vs IR callee='" << irCallee << "'\n";
-
         // Remove _N suffix from IR callee (e.g., "transpose_mul_0" -> "transpose_mul")
-        // Split on last '_' and check if suffix is a number
         auto splitResult = irCallee.rsplit('_');
         StringRef irCalleePrefix = splitResult.first;
         StringRef suffix = splitResult.second;
@@ -637,31 +619,19 @@ private:
                                    [](char c) { return std::isdigit(c); });
 
         if (hasSuffix) {
-          llvm::errs() << "  [matchOp] IR callee has numeric suffix, using prefix: '"
-                       << irCalleePrefix << "'\n";
-          // Check if IR callee prefix matches pattern callee exactly
           if (irCalleePrefix != patternCallee) {
-            llvm::errs() << "  [matchOp] ✗ Callee prefix doesn't match\n";
             return false;
           }
         } else {
-          // No numeric suffix, require exact match
           if (irCallee != patternCallee) {
-            llvm::errs() << "  [matchOp] ✗ Callee doesn't match (no suffix)\n";
             return false;
           }
         }
-
-        llvm::errs() << "  [matchOp] ✓ Callee matched!\n";
-        // Continue to match operands below
       }
     }
 
     // Match operand count
     if (patternOp->getNumOperands() != irOp->getNumOperands()) {
-      llvm::errs() << "  [matchOp] ✗ Operand counts don't match ("
-                   << patternOp->getNumOperands() << " vs "
-                   << irOp->getNumOperands() << ")\n";
       return false;
     }
 
@@ -673,7 +643,6 @@ private:
       }
     }
 
-    llvm::errs() << "  [matchOp] ✓ Operation matched successfully\n";
     return true;
   }
 
@@ -681,14 +650,10 @@ private:
   // This handles DAG patterns by matching based on data dependencies
   bool matchSequence(Operation *startOp, size_t patternIndex) {
     if (patternIndex >= patternOps.size()) {
-      // Successfully matched all pattern operations
-      return true;
+      return true;  // Successfully matched all pattern operations
     }
 
     Operation *patternOp = patternOps[patternIndex];
-
-    llvm::errs() << "[matchDAG] Matching pattern op " << patternIndex
-                 << " (" << patternOp->getName() << ")\n";
 
     // Try to match this pattern operation with startOp
     if (!matchOp(patternOp, startOp)) {
@@ -704,7 +669,6 @@ private:
     }
 
     // Try to match remaining pattern operations
-    // Search for them based on data dependencies, not sequential order
     if (matchRemainingOps(patternIndex + 1)) {
       return true;
     }
@@ -721,20 +685,9 @@ private:
     }
 
     Operation *patternOp = patternOps[startIndex];
-
-    llvm::errs() << "[matchRemaining] Looking for pattern op " << startIndex
-                 << " (" << patternOp->getName() << ")\n";
-
-    // Find candidate operations in the IR that could match this pattern op
-    // Strategy: look for operations that:
-    // 1. Have the same name
-    // 2. Are in the same block as already matched ops
-    // 3. Use values we've already bound
-
     Block *searchBlock = matchedOps.empty() ? nullptr : matchedOps[0]->getBlock();
 
     if (!searchBlock) {
-      llvm::errs() << "[matchRemaining] ✗ No search block\n";
       return false;
     }
 
@@ -761,18 +714,27 @@ private:
 
         // Backtrack
         matchedOps.pop_back();
-        // Note: bindings are not removed here, which is OK because we'll clear
-        // them when we try a new match from scratch
       }
     }
 
-    llvm::errs() << "[matchRemaining] ✗ Could not find match for pattern op " << startIndex << "\n";
     return false;
   }
 };
 
 //===----------------------------------------------------------------------===//
-// Pattern Extraction and Replacement
+//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+//
+//                    PART 3: FUNCTION TRANSFORMATIONS
+//
+// This section handles function extraction, inlining, and cleanup:
+// 1. Extract matched patterns into new toy.func operations
+// 2. Replace matched operations with toy.generic_call
+// 3. Inline called functions to avoid nested function calls
+// 4. Remove dead (unused) functions
+//
+//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 //===----------------------------------------------------------------------===//
 
 class FunctionExtractor {
@@ -780,7 +742,6 @@ public:
   // Extract matched pattern to a new toy.func and replace with call
   void extractAndReplace(PatternMatch &match, PatternInfo &pattern,
                          StringRef funcName, ModuleOp module, OpBuilder &builder) {
-    llvm::errs() << "\n[FunctionExtractor] Extracting match to function: " << funcName << "\n";
 
     // Get the pattern function to determine inputs/outputs
     toy::FuncOp patternFunc = nullptr;
@@ -791,7 +752,6 @@ public:
     });
 
     if (!patternFunc) {
-      llvm::errs() << "[FunctionExtractor] ERROR: Pattern function not found\n";
       return;
     }
 
@@ -815,8 +775,6 @@ public:
       }
     }
 
-    llvm::errs() << "[FunctionExtractor] Found " << inputs.size() << " inputs\n";
-
     // Compute outputs: results of matched ops used outside the match
     SmallVector<Value> outputs;
     for (auto *op : match.matchedOps) {
@@ -831,8 +789,6 @@ public:
         }
       }
     }
-
-    llvm::errs() << "[FunctionExtractor] Found " << outputs.size() << " outputs\n";
 
     // Create function type
     SmallVector<Type> inputTypes;
@@ -854,9 +810,6 @@ public:
     auto func = builder.create<toy::FuncOp>(match.loc, funcName, funcType);
     func.setPrivate();
 
-    llvm::errs() << "[FunctionExtractor] Created function with " << inputTypes.size()
-                 << " inputs and " << outputTypes.size() << " outputs\n";
-
     // Get or create function body
     Block *funcBody;
     if (func.getBody().empty()) {
@@ -872,9 +825,6 @@ public:
       mapper.map(input, arg);
     }
 
-    llvm::errs() << "[FunctionExtractor] Cloning " << match.matchedOps.size()
-                 << " operations into function body\n";
-
     for (auto *op : match.matchedOps) {
       builder.clone(*op, mapper);
     }
@@ -886,46 +836,32 @@ public:
     }
     builder.create<toy::ReturnOp>(match.loc, returnVals);
 
-    llvm::errs() << "[FunctionExtractor] Function created successfully\n";
-
     // Replace matched operations with a call
     builder.setInsertionPoint(match.matchedOps.front());
 
     auto call = builder.create<toy::GenericCallOp>(
         match.loc,
-        outputs.empty() ? Type() : outputs[0].getType(),  // GenericCallOp returns single value
+        outputs.empty() ? Type() : outputs[0].getType(),
         mlir::SymbolRefAttr::get(builder.getContext(), funcName),
         inputs);
-
-    llvm::errs() << "[FunctionExtractor] Created call operation\n";
 
     // Replace uses of matched op results with call result
     if (!outputs.empty()) {
       outputs[0].replaceAllUsesWith(call.getResult());
     }
 
-    llvm::errs() << "[FunctionExtractor] Replaced " << outputs.size() << " values\n";
-
     // Erase matched operations
     for (auto *op : llvm::reverse(match.matchedOps)) {
-      llvm::errs() << "[FunctionExtractor] Erasing " << op->getName() << "\n";
       op->erase();
     }
-
-    llvm::errs() << "[FunctionExtractor] Extraction complete!\n";
   }
 
   // Inline all toy.generic_call operations within a function
   void inlineCalledFunctions(toy::FuncOp func, ModuleOp module) {
-    llvm::errs() << "\n[FunctionInliner] Starting inlining for function: " << func.getName() << "\n";
-
     // Keep inlining until no more calls remain
     bool changed = true;
-    int iteration = 0;
     while (changed) {
       changed = false;
-      iteration++;
-      llvm::errs() << "[FunctionInliner] Iteration " << iteration << "\n";
 
       // Find all generic_call operations
       SmallVector<toy::GenericCallOp> callsToInline;
@@ -933,20 +869,14 @@ public:
         callsToInline.push_back(callOp);
       });
 
-      llvm::errs() << "[FunctionInliner] Found " << callsToInline.size() << " calls to inline\n";
-
       for (auto callOp : callsToInline) {
         StringRef callee = callOp.getCallee();
-        llvm::errs() << "[FunctionInliner] Inlining call to: " << callee << "\n";
 
         // Find the called function in the module
         auto calledFunc = module.lookupSymbol<toy::FuncOp>(callee);
         if (!calledFunc) {
-          llvm::errs() << "[FunctionInliner] ✗ Function not found: " << callee << "\n";
           continue;
         }
-
-        llvm::errs() << "[FunctionInliner] ✓ Found function to inline\n";
 
         // Create builder at call site
         OpBuilder builder(callOp);
@@ -956,57 +886,44 @@ public:
         for (auto [arg, operand] : llvm::zip(
                calledFunc.getArguments(), callOp.getOperands())) {
           mapping.map(arg, operand);
-          llvm::errs() << "[FunctionInliner] Mapped argument to operand\n";
         }
 
         // Clone all operations from function body (except return)
         Value inlinedResult;
         Block &calledBody = calledFunc.getBody().front();
 
-        llvm::errs() << "[FunctionInliner] Cloning "
-                     << calledBody.getOperations().size() << " operations\n";
-
         for (Operation &op : calledBody.getOperations()) {
           if (auto returnOp = dyn_cast<toy::ReturnOp>(&op)) {
             // Get the returned value (will replace call result)
             if (returnOp.getNumOperands() > 0) {
               inlinedResult = mapping.lookup(returnOp.getOperand(0));
-              llvm::errs() << "[FunctionInliner] Found return value\n";
             }
           } else {
             // Clone the operation
-            Operation *cloned = builder.clone(op, mapping);
-            llvm::errs() << "[FunctionInliner] Cloned: " << cloned->getName() << "\n";
+            builder.clone(op, mapping);
           }
         }
 
         // Replace call with inlined result
         if (inlinedResult) {
           callOp.getResult().replaceAllUsesWith(inlinedResult);
-          llvm::errs() << "[FunctionInliner] Replaced call result with inlined value\n";
         }
 
         // Erase the call
         callOp.erase();
-        llvm::errs() << "[FunctionInliner] Erased call operation\n";
 
         changed = true;
       }
     }
-
-    llvm::errs() << "[FunctionInliner] Inlining complete after " << iteration << " iterations\n";
   }
 
   // Remove dead (unused) functions from the module
   // Keeps main function and any functions that are called
   static void removeDeadFunctions(ModuleOp module) {
-    llvm::errs() << "\n[DeadFunctionElimination] Starting dead function elimination\n";
-
     // Collect all function calls in the module
     DenseSet<StringRef> calledFunctions;
     module.walk([&](toy::GenericCallOp callOp) {
       calledFunctions.insert(callOp.getCallee());
-      llvm::errs() << "[DeadFunctionElimination] Function is called: " << callOp.getCallee() << "\n";
     });
 
     // Find functions to remove (private functions that are never called)
@@ -1014,35 +931,21 @@ public:
     module.walk([&](toy::FuncOp func) {
       StringRef funcName = func.getName();
 
-      // Keep main function
-      if (funcName == "main") {
-        llvm::errs() << "[DeadFunctionElimination] Keeping main function\n";
-        return;
-      }
-
-      // Keep public functions
-      if (!func.isPrivate()) {
-        llvm::errs() << "[DeadFunctionElimination] Keeping public function: " << funcName << "\n";
+      // Keep main function and public functions
+      if (funcName == "main" || !func.isPrivate()) {
         return;
       }
 
       // Check if function is called
       if (!calledFunctions.contains(funcName)) {
-        llvm::errs() << "[DeadFunctionElimination] ✗ Marking for removal: " << funcName << " (unused)\n";
         toErase.push_back(func);
-      } else {
-        llvm::errs() << "[DeadFunctionElimination] ✓ Keeping function: " << funcName << " (used)\n";
       }
     });
 
     // Remove dead functions
-    llvm::errs() << "[DeadFunctionElimination] Removing " << toErase.size() << " dead functions\n";
     for (auto func : toErase) {
-      llvm::errs() << "[DeadFunctionElimination] Erasing function: " << func.getName() << "\n";
       func.erase();
     }
-
-    llvm::errs() << "[DeadFunctionElimination] Complete!\n";
   }
 };
 
@@ -1078,51 +981,25 @@ void ToyToAffineLoweringPass::runOnOperation() {
     {"transpose_mul_add", "patterns/transpose_mul_add.mlir"}
   };
 
-  llvm::errs() << "\n========== TESTING MULTIPLE PATTERNS ==========\n";
-  llvm::errs() << "Will try " << patternFiles.size() << " patterns\n\n";
-
   // Try each pattern
   for (auto &[patternName, patternPath] : patternFiles) {
-    llvm::errs() << "\n********** Pattern: " << patternName << " **********\n";
-    llvm::errs() << "File: " << patternPath << "\n";
-
-    // ========== STEP 1: Parse pattern file ==========
     PatternInfo patternInfo;
     patternInfo.name = patternName;
 
     if (failed(parsePatternFile(patternPath, &getContext(), patternInfo))) {
-      llvm::errs() << "[LowerToAffine] ERROR: Pattern parsing failed for "
-                   << patternName << "\n";
-      llvm::errs() << "**********************************************\n\n";
+      llvm::errs() << "ERROR: Failed to parse pattern '" << patternName << "'\n";
       continue;
     }
 
-    llvm::errs() << "[LowerToAffine] Pattern parsing succeeded!\n";
     patternInfo.dump();
-
-    // ========== STEP 2: Pattern Matching ==========
-    llvm::errs() << "\n--- Pattern Matching ---\n";
 
     if (patternInfo.patternModule) {
       PatternMatcher matcher(patternInfo);
       SmallVector<PatternMatch> matches = matcher.findMatches(getOperation());
 
-      llvm::errs() << "\n[LowerToAffine] Found " << matches.size() << " matches for "
-                   << patternName << "\n";
+      llvm::errs() << "  Found " << matches.size() << " match(es)\n";
 
       if (!matches.empty()) {
-        for (size_t i = 0; i < matches.size(); ++i) {
-          llvm::errs() << "\n  Match " << i << ":\n";
-          llvm::errs() << "    Location: " << matches[i].loc << "\n";
-          llvm::errs() << "    Matched operations: " << matches[i].matchedOps.size() << "\n";
-          for (auto *op : matches[i].matchedOps) {
-            llvm::errs() << "      - " << op->getName() << "\n";
-          }
-        }
-
-        // ========== Extract matches to functions ==========
-        llvm::errs() << "\n--- Extracting to functions ---\n";
-
         FunctionExtractor extractor;
         OpBuilder builder(&getContext());
 
@@ -1132,32 +1009,22 @@ void ToyToAffineLoweringPass::runOnOperation() {
           extractor.extractAndReplace(matches[i], patternInfo, funcName,
                                        getOperation(), builder);
 
-          // Find the newly created function
           auto newFunc = getOperation().lookupSymbol<toy::FuncOp>(funcName);
           if (newFunc) {
             extractedFuncs.push_back(newFunc);
           }
         }
 
-        // ========== Inline called functions ==========
-        llvm::errs() << "\n--- Inlining called functions ---\n";
+        // Inline called functions
         for (auto func : extractedFuncs) {
           extractor.inlineCalledFunctions(func, getOperation());
         }
-      } else {
-        llvm::errs() << "[LowerToAffine] ✗ No matches found for " << patternName << "\n";
       }
     }
-
-    llvm::errs() << "**********************************************\n\n";
   }
 
-  llvm::errs() << "============ ALL PATTERNS TESTED ============\n\n";
-
-  // ========== Dead Function Elimination ==========
-  llvm::errs() << "========== Dead Function Elimination ==========\n";
+  // Dead function elimination
   FunctionExtractor::removeDeadFunctions(getOperation());
-  llvm::errs() << "================================================\n\n";
 
   // COMMENTED OUT: Old TransposeMulPattern - testing new pattern matcher instead
   // // First, apply the TransposeMulPattern as a greedy rewrite
