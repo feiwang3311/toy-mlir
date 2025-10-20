@@ -34,6 +34,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Sequence.h"
@@ -522,6 +523,312 @@ LogicalResult parsePatternFile(StringRef filePath, MLIRContext *context,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// Pattern Matching Infrastructure
+//===----------------------------------------------------------------------===//
+
+// Structure to hold a single pattern match result
+struct PatternMatch {
+  SmallVector<Operation*> matchedOps;     // Operations that matched
+  DenseMap<Value, Value> valueBindings;   // Pattern value -> IR value
+  Location loc;                            // Location of the match
+
+  PatternMatch(Location loc) : loc(loc) {}
+};
+
+class PatternMatcher {
+public:
+  PatternMatcher(PatternInfo &pattern) : pattern(pattern) {
+    // Get the pattern function to access its operations
+    toy::FuncOp patternFunc = nullptr;
+    pattern.patternModule->walk([&](toy::FuncOp func) {
+      if (func.getName() == "pattern") {
+        patternFunc = func;
+      }
+    });
+
+    if (patternFunc) {
+      Block *patternBlock = &patternFunc.getBody().front();
+      for (auto &op : patternBlock->getOperations()) {
+        if (!isa<func::ReturnOp>(&op) && !isa<toy::ReturnOp>(&op)) {
+          patternOps.push_back(&op);
+        }
+      }
+    }
+  }
+
+  // Find all matches in the module
+  SmallVector<PatternMatch> findMatches(ModuleOp module) {
+    SmallVector<PatternMatch> matches;
+
+    llvm::errs() << "[PatternMatcher] Searching for pattern matches...\n";
+    llvm::errs() << "[PatternMatcher] Pattern has " << patternOps.size()
+                 << " operations to match\n";
+
+    // Walk all operations in the module
+    module.walk([&](Operation *op) {
+      // Try to match starting from this operation
+      bindings.clear();
+      matchedOps.clear();
+
+      if (matchSequence(op, 0)) {
+        llvm::errs() << "[PatternMatcher] ✓ Found match at " << op->getLoc() << "\n";
+
+        PatternMatch match(op->getLoc());
+        match.matchedOps = matchedOps;
+        match.valueBindings = bindings;
+        matches.push_back(match);
+      }
+    });
+
+    llvm::errs() << "[PatternMatcher] Found " << matches.size() << " total matches\n";
+    return matches;
+  }
+
+private:
+  PatternInfo &pattern;
+  SmallVector<Operation*> patternOps;              // Pattern operations
+  DenseMap<Value, Value> bindings;                 // Pattern value -> IR value
+  SmallVector<Operation*> matchedOps;              // Currently matched ops
+
+  // Match a value, respecting existing bindings
+  bool matchValue(Value patternVal, Value irVal) {
+    // Check if this pattern value is already bound
+    if (bindings.count(patternVal)) {
+      bool matches = (bindings[patternVal] == irVal);
+      if (!matches) {
+        llvm::errs() << "  [matchValue] ✗ Binding conflict: pattern value already bound to different IR value\n";
+      }
+      return matches;
+    }
+
+    // First time seeing this pattern value - bind it
+    bindings[patternVal] = irVal;
+    llvm::errs() << "  [matchValue] ✓ Bound pattern value to IR value\n";
+    return true;
+  }
+
+  // Match a single operation
+  bool matchOp(Operation *patternOp, Operation *irOp) {
+    llvm::errs() << "  [matchOp] Trying to match " << patternOp->getName()
+                 << " with " << irOp->getName() << "\n";
+
+    // Match operation name (ignore types)
+    if (patternOp->getName() != irOp->getName()) {
+      llvm::errs() << "  [matchOp] ✗ Operation names don't match\n";
+      return false;
+    }
+
+    // Match operand count
+    if (patternOp->getNumOperands() != irOp->getNumOperands()) {
+      llvm::errs() << "  [matchOp] ✗ Operand counts don't match ("
+                   << patternOp->getNumOperands() << " vs "
+                   << irOp->getNumOperands() << ")\n";
+      return false;
+    }
+
+    // Match operands (with SSA binding)
+    for (auto [patternOperand, irOperand] :
+         llvm::zip(patternOp->getOperands(), irOp->getOperands())) {
+      if (!matchValue(patternOperand, irOperand)) {
+        return false;
+      }
+    }
+
+    llvm::errs() << "  [matchOp] ✓ Operation matched successfully\n";
+    return true;
+  }
+
+  // Match a sequence of operations starting from index
+  bool matchSequence(Operation *startOp, size_t patternIndex) {
+    if (patternIndex >= patternOps.size()) {
+      // Successfully matched all pattern operations
+      return true;
+    }
+
+    Operation *patternOp = patternOps[patternIndex];
+
+    llvm::errs() << "[matchSequence] Matching pattern op " << patternIndex
+                 << " (" << patternOp->getName() << ") starting from "
+                 << startOp->getName() << " at " << startOp->getLoc() << "\n";
+
+    // Try to match the current pattern operation with startOp
+    if (!matchOp(patternOp, startOp)) {
+      return false;
+    }
+
+    // Add to matched operations
+    matchedOps.push_back(startOp);
+
+    // Bind pattern result to IR result
+    if (patternOp->getNumResults() == 1 && startOp->getNumResults() == 1) {
+      bindings[patternOp->getResult(0)] = startOp->getResult(0);
+    }
+
+    // For now, just try the next operation in sequence
+    // This is a simplified linear match - we'll enhance this later for DAGs
+    Operation *nextOp = startOp->getNextNode();
+    if (!nextOp) {
+      llvm::errs() << "[matchSequence] ✗ No next operation\n";
+      matchedOps.pop_back();
+      return false;
+    }
+
+    if (matchSequence(nextOp, patternIndex + 1)) {
+      return true;
+    }
+
+    // Backtrack
+    matchedOps.pop_back();
+    return false;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern Extraction and Replacement
+//===----------------------------------------------------------------------===//
+
+class FunctionExtractor {
+public:
+  // Extract matched pattern to a new toy.func and replace with call
+  void extractAndReplace(PatternMatch &match, PatternInfo &pattern,
+                         StringRef funcName, ModuleOp module, OpBuilder &builder) {
+    llvm::errs() << "\n[FunctionExtractor] Extracting match to function: " << funcName << "\n";
+
+    // Get the pattern function to determine inputs/outputs
+    toy::FuncOp patternFunc = nullptr;
+    pattern.patternModule->walk([&](toy::FuncOp func) {
+      if (func.getName() == "pattern") {
+        patternFunc = func;
+      }
+    });
+
+    if (!patternFunc) {
+      llvm::errs() << "[FunctionExtractor] ERROR: Pattern function not found\n";
+      return;
+    }
+
+    // Compute inputs: values used but not produced by matched ops
+    SmallVector<Value> inputs;
+    llvm::SmallPtrSet<Value, 8> producedValues;
+
+    for (auto *op : match.matchedOps) {
+      for (auto result : op->getResults()) {
+        producedValues.insert(result);
+      }
+    }
+
+    llvm::SmallPtrSet<Value, 8> inputSet;
+    for (auto *op : match.matchedOps) {
+      for (auto operand : op->getOperands()) {
+        if (!producedValues.contains(operand) && !inputSet.contains(operand)) {
+          inputs.push_back(operand);
+          inputSet.insert(operand);
+        }
+      }
+    }
+
+    llvm::errs() << "[FunctionExtractor] Found " << inputs.size() << " inputs\n";
+
+    // Compute outputs: results of matched ops used outside the match
+    SmallVector<Value> outputs;
+    for (auto *op : match.matchedOps) {
+      for (auto result : op->getResults()) {
+        for (auto user : result.getUsers()) {
+          if (std::find(match.matchedOps.begin(), match.matchedOps.end(), user) ==
+              match.matchedOps.end()) {
+            // Used outside the matched region
+            outputs.push_back(result);
+            break;
+          }
+        }
+      }
+    }
+
+    llvm::errs() << "[FunctionExtractor] Found " << outputs.size() << " outputs\n";
+
+    // Create function type
+    SmallVector<Type> inputTypes;
+    for (auto input : inputs) {
+      inputTypes.push_back(input.getType());
+    }
+
+    SmallVector<Type> outputTypes;
+    for (auto output : outputs) {
+      outputTypes.push_back(output.getType());
+    }
+
+    auto funcType = builder.getFunctionType(inputTypes, outputTypes);
+
+    // Create the function at module level
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(module.getBody());
+
+    auto func = builder.create<toy::FuncOp>(match.loc, funcName, funcType);
+    func.setPrivate();
+
+    llvm::errs() << "[FunctionExtractor] Created function with " << inputTypes.size()
+                 << " inputs and " << outputTypes.size() << " outputs\n";
+
+    // Get or create function body
+    Block *funcBody;
+    if (func.getBody().empty()) {
+      funcBody = func.addEntryBlock();
+    } else {
+      funcBody = &func.getBody().front();
+    }
+    builder.setInsertionPointToStart(funcBody);
+
+    // Clone matched operations into function
+    IRMapping mapper;
+    for (auto [input, arg] : llvm::zip(inputs, funcBody->getArguments())) {
+      mapper.map(input, arg);
+    }
+
+    llvm::errs() << "[FunctionExtractor] Cloning " << match.matchedOps.size()
+                 << " operations into function body\n";
+
+    for (auto *op : match.matchedOps) {
+      builder.clone(*op, mapper);
+    }
+
+    // Add return statement
+    SmallVector<Value> returnVals;
+    for (auto output : outputs) {
+      returnVals.push_back(mapper.lookup(output));
+    }
+    builder.create<toy::ReturnOp>(match.loc, returnVals);
+
+    llvm::errs() << "[FunctionExtractor] Function created successfully\n";
+
+    // Replace matched operations with a call
+    builder.setInsertionPoint(match.matchedOps.front());
+
+    auto call = builder.create<toy::GenericCallOp>(
+        match.loc,
+        outputs.empty() ? Type() : outputs[0].getType(),  // GenericCallOp returns single value
+        mlir::SymbolRefAttr::get(builder.getContext(), funcName),
+        inputs);
+
+    llvm::errs() << "[FunctionExtractor] Created call operation\n";
+
+    // Replace uses of matched op results with call result
+    if (!outputs.empty()) {
+      outputs[0].replaceAllUsesWith(call.getResult());
+    }
+
+    llvm::errs() << "[FunctionExtractor] Replaced " << outputs.size() << " values\n";
+
+    // Erase matched operations
+    for (auto *op : llvm::reverse(match.matchedOps)) {
+      llvm::errs() << "[FunctionExtractor] Erasing " << op->getName() << "\n";
+      op->erase();
+    }
+
+    llvm::errs() << "[FunctionExtractor] Extraction complete!\n";
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -564,16 +871,57 @@ void ToyToAffineLoweringPass::runOnOperation() {
 
   llvm::errs() << "===============================================\n\n";
 
-  // First, apply the TransposeMulPattern as a greedy rewrite
-  // This runs before the conversion framework, so it works on legal ops
-  llvm::errs() << "[LowerToAffine] Running TransposeMulPattern first...\n";
-  RewritePatternSet patterns(&getContext());
-  patterns.add<TransposeMulPattern>(&getContext());
-  if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
-    llvm::errs() << "[LowerToAffine] Greedy rewrite failed\n";
-  } else {
-    llvm::errs() << "[LowerToAffine] Greedy rewrite completed\n";
+  // ========== STEP 2: Pattern Matching ==========
+  llvm::errs() << "\n========== PATTERN MATCHING TEST ==========\n";
+
+  if (patternInfo.patternModule) {
+    PatternMatcher matcher(patternInfo);
+    SmallVector<PatternMatch> matches = matcher.findMatches(getOperation());
+
+    llvm::errs() << "\n[LowerToAffine] Pattern matching complete!\n";
+    llvm::errs() << "[LowerToAffine] Found " << matches.size() << " matches\n";
+    llvm::errs() << "[LowerToAffine] matches.empty() = " << matches.empty() << "\n";
+
+    for (size_t i = 0; i < matches.size(); ++i) {
+      llvm::errs() << "\n--- Match " << i << " ---\n";
+      llvm::errs() << "  Location: " << matches[i].loc << "\n";
+      llvm::errs() << "  Matched operations (" << matches[i].matchedOps.size() << "):\n";
+      for (auto *op : matches[i].matchedOps) {
+        llvm::errs() << "    - " << op->getName() << " at " << op->getLoc() << "\n";
+      }
+      llvm::errs() << "  Value bindings: " << matches[i].valueBindings.size() << "\n";
+    }
+
+    // ========== Extract matches to functions ==========
+    if (!matches.empty()) {
+      llvm::errs() << "\n========== EXTRACTING MATCHES TO FUNCTIONS ==========\n";
+
+      FunctionExtractor extractor;
+      OpBuilder builder(&getContext());
+
+      for (size_t i = 0; i < matches.size(); ++i) {
+        std::string funcName = patternInfo.name + "_" + std::to_string(i);
+        extractor.extractAndReplace(matches[i], patternInfo, funcName,
+                                     getOperation(), builder);
+      }
+
+      llvm::errs() << "=====================================================\n";
+    }
   }
+
+  llvm::errs() << "===========================================\n\n";
+
+  // COMMENTED OUT: Old TransposeMulPattern - testing new pattern matcher instead
+  // // First, apply the TransposeMulPattern as a greedy rewrite
+  // // This runs before the conversion framework, so it works on legal ops
+  // llvm::errs() << "[LowerToAffine] Running TransposeMulPattern first...\n";
+  // RewritePatternSet patterns(&getContext());
+  // patterns.add<TransposeMulPattern>(&getContext());
+  // if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
+  //   llvm::errs() << "[LowerToAffine] Greedy rewrite failed\n";
+  // } else {
+  //   llvm::errs() << "[LowerToAffine] Greedy rewrite completed\n";
+  // }
 
   // The first thing to define is the conversion target. This will define the
   // final target for this lowering.
