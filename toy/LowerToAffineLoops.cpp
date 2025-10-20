@@ -33,10 +33,13 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Parser/Parser.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -415,6 +418,113 @@ struct TransposeMulPattern : public OpRewritePattern<toy::MulOp> {
 } // namespace
 
 //===----------------------------------------------------------------------===//
+// Pattern File Parsing Infrastructure
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Structure to hold parsed pattern information
+struct PatternInfo {
+  SmallVector<std::string> operationNames;  // Operation names in the pattern
+  size_t numInputs;                          // Number of inputs
+  size_t numOutputs;                         // Number of outputs
+  std::string name;                          // Pattern name
+  OwningOpRef<ModuleOp> patternModule;      // Keep the parsed module alive
+
+  void dump() const {
+    llvm::errs() << "=== Pattern: " << name << " ===\n";
+    llvm::errs() << "Operations (" << operationNames.size() << "):\n";
+    for (const auto &opName : operationNames) {
+      llvm::errs() << "  " << opName << "\n";
+    }
+    llvm::errs() << "Inputs: " << numInputs << "\n";
+    llvm::errs() << "Outputs: " << numOutputs << "\n";
+    llvm::errs() << "===================\n";
+  }
+};
+
+// Parse a pattern file and extract pattern information
+LogicalResult parsePatternFile(StringRef filePath, MLIRContext *context,
+                               PatternInfo &patternInfo) {
+  llvm::errs() << "[PatternParser] Reading pattern file: " << filePath << "\n";
+
+  // Read the pattern file
+  auto fileOrErr = llvm::MemoryBuffer::getFile(filePath);
+  if (!fileOrErr) {
+    llvm::errs() << "[PatternParser] ERROR: Could not read file: "
+                 << fileOrErr.getError().message() << "\n";
+    return failure();
+  }
+
+  llvm::errs() << "[PatternParser] File contents:\n"
+               << fileOrErr.get()->getBuffer() << "\n";
+
+  // Parse the MLIR snippet as a module
+  llvm::SourceMgr sourceMgr;
+  sourceMgr.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
+
+  patternInfo.patternModule = parseSourceFile<ModuleOp>(sourceMgr, context);
+  if (!patternInfo.patternModule) {
+    llvm::errs() << "[PatternParser] ERROR: Failed to parse pattern file as module\n";
+    return failure();
+  }
+
+  llvm::errs() << "[PatternParser] Successfully parsed module\n";
+
+  // Find the pattern function
+  toy::FuncOp patternFunc = nullptr;
+  patternInfo.patternModule->walk([&](toy::FuncOp func) {
+    if (func.getName() == "pattern") {
+      patternFunc = func;
+    }
+  });
+
+  if (!patternFunc) {
+    llvm::errs() << "[PatternParser] ERROR: No toy.func @pattern found\n";
+    return failure();
+  }
+
+  llvm::errs() << "[PatternParser] Found pattern function with "
+               << patternFunc.getNumArguments() << " arguments\n";
+
+  // Get the function body
+  Block *patternBlock = &patternFunc.getBody().front();
+
+  llvm::errs() << "[PatternParser] Function body has "
+               << patternBlock->getOperations().size() << " operations\n";
+
+  // Extract operation names (except return)
+  Operation *returnOp = nullptr;
+  for (auto &op : patternBlock->getOperations()) {
+    if (isa<func::ReturnOp>(&op) || isa<toy::ReturnOp>(&op)) {
+      returnOp = &op;
+      llvm::errs() << "[PatternParser] Found return op\n";
+    } else {
+      patternInfo.operationNames.push_back(op.getName().getStringRef().str());
+      llvm::errs() << "[PatternParser] Added operation: " << op.getName() << "\n";
+    }
+  }
+
+  if (!returnOp) {
+    llvm::errs() << "[PatternParser] ERROR: No return operation found\n";
+    return failure();
+  }
+
+  // Count outputs from return operands
+  patternInfo.numOutputs = returnOp->getNumOperands();
+  llvm::errs() << "[PatternParser] Outputs: " << patternInfo.numOutputs << "\n";
+
+  // Count inputs: function arguments
+  patternInfo.numInputs = patternFunc.getNumArguments();
+  llvm::errs() << "[PatternParser] Inputs: " << patternInfo.numInputs << "\n";
+
+  llvm::errs() << "[PatternParser] Pattern parsing complete!\n";
+  return success();
+}
+
+} // namespace
+
+//===----------------------------------------------------------------------===//
 // ToyToAffineLoweringPass
 //===----------------------------------------------------------------------===//
 
@@ -435,6 +545,25 @@ struct ToyToAffineLoweringPass
 } // namespace
 
 void ToyToAffineLoweringPass::runOnOperation() {
+  // ========== STEP 1: Parse pattern file ==========
+  llvm::errs() << "\n========== PATTERN FILE PARSING TEST ==========\n";
+
+  PatternInfo patternInfo;
+  patternInfo.name = "transpose_mul";
+
+  // Hardcoded pattern file path (adjust as needed)
+  std::string patternFilePath = "patterns/transpose_mul.mlir";
+
+  if (failed(parsePatternFile(patternFilePath, &getContext(), patternInfo))) {
+    llvm::errs() << "[LowerToAffine] ERROR: Pattern parsing failed!\n";
+    // Continue with rest of pass for now
+  } else {
+    llvm::errs() << "[LowerToAffine] Pattern parsing succeeded!\n";
+    patternInfo.dump();
+  }
+
+  llvm::errs() << "===============================================\n\n";
+
   // First, apply the TransposeMulPattern as a greedy rewrite
   // This runs before the conversion framework, so it works on legal ops
   llvm::errs() << "[LowerToAffine] Running TransposeMulPattern first...\n";
