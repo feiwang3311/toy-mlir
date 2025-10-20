@@ -852,64 +852,76 @@ struct ToyToAffineLoweringPass
 } // namespace
 
 void ToyToAffineLoweringPass::runOnOperation() {
-  // ========== STEP 1: Parse pattern file ==========
-  llvm::errs() << "\n========== PATTERN FILE PARSING TEST ==========\n";
+  // List of pattern files to try
+  SmallVector<std::pair<std::string, std::string>> patternFiles = {
+    {"transpose_mul", "patterns/transpose_mul.mlir"},
+    {"transpose_dag", "patterns/transpose_dag.mlir"},
+    {"double_transpose", "patterns/double_transpose.mlir"},
+    {"add_mul_chain", "patterns/add_mul_chain.mlir"}
+  };
 
-  PatternInfo patternInfo;
-  patternInfo.name = "transpose_mul";
+  llvm::errs() << "\n========== TESTING MULTIPLE PATTERNS ==========\n";
+  llvm::errs() << "Will try " << patternFiles.size() << " patterns\n\n";
 
-  // Hardcoded pattern file path (adjust as needed)
-  std::string patternFilePath = "patterns/transpose_mul.mlir";
+  // Try each pattern
+  for (auto &[patternName, patternPath] : patternFiles) {
+    llvm::errs() << "\n********** Pattern: " << patternName << " **********\n";
+    llvm::errs() << "File: " << patternPath << "\n";
 
-  if (failed(parsePatternFile(patternFilePath, &getContext(), patternInfo))) {
-    llvm::errs() << "[LowerToAffine] ERROR: Pattern parsing failed!\n";
-    // Continue with rest of pass for now
-  } else {
+    // ========== STEP 1: Parse pattern file ==========
+    PatternInfo patternInfo;
+    patternInfo.name = patternName;
+
+    if (failed(parsePatternFile(patternPath, &getContext(), patternInfo))) {
+      llvm::errs() << "[LowerToAffine] ERROR: Pattern parsing failed for "
+                   << patternName << "\n";
+      llvm::errs() << "**********************************************\n\n";
+      continue;
+    }
+
     llvm::errs() << "[LowerToAffine] Pattern parsing succeeded!\n";
     patternInfo.dump();
-  }
 
-  llvm::errs() << "===============================================\n\n";
+    // ========== STEP 2: Pattern Matching ==========
+    llvm::errs() << "\n--- Pattern Matching ---\n";
 
-  // ========== STEP 2: Pattern Matching ==========
-  llvm::errs() << "\n========== PATTERN MATCHING TEST ==========\n";
+    if (patternInfo.patternModule) {
+      PatternMatcher matcher(patternInfo);
+      SmallVector<PatternMatch> matches = matcher.findMatches(getOperation());
 
-  if (patternInfo.patternModule) {
-    PatternMatcher matcher(patternInfo);
-    SmallVector<PatternMatch> matches = matcher.findMatches(getOperation());
+      llvm::errs() << "\n[LowerToAffine] Found " << matches.size() << " matches for "
+                   << patternName << "\n";
 
-    llvm::errs() << "\n[LowerToAffine] Pattern matching complete!\n";
-    llvm::errs() << "[LowerToAffine] Found " << matches.size() << " matches\n";
-    llvm::errs() << "[LowerToAffine] matches.empty() = " << matches.empty() << "\n";
+      if (!matches.empty()) {
+        for (size_t i = 0; i < matches.size(); ++i) {
+          llvm::errs() << "\n  Match " << i << ":\n";
+          llvm::errs() << "    Location: " << matches[i].loc << "\n";
+          llvm::errs() << "    Matched operations: " << matches[i].matchedOps.size() << "\n";
+          for (auto *op : matches[i].matchedOps) {
+            llvm::errs() << "      - " << op->getName() << "\n";
+          }
+        }
 
-    for (size_t i = 0; i < matches.size(); ++i) {
-      llvm::errs() << "\n--- Match " << i << " ---\n";
-      llvm::errs() << "  Location: " << matches[i].loc << "\n";
-      llvm::errs() << "  Matched operations (" << matches[i].matchedOps.size() << "):\n";
-      for (auto *op : matches[i].matchedOps) {
-        llvm::errs() << "    - " << op->getName() << " at " << op->getLoc() << "\n";
+        // ========== Extract matches to functions ==========
+        llvm::errs() << "\n--- Extracting to functions ---\n";
+
+        FunctionExtractor extractor;
+        OpBuilder builder(&getContext());
+
+        for (size_t i = 0; i < matches.size(); ++i) {
+          std::string funcName = patternInfo.name + "_" + std::to_string(i);
+          extractor.extractAndReplace(matches[i], patternInfo, funcName,
+                                       getOperation(), builder);
+        }
+      } else {
+        llvm::errs() << "[LowerToAffine] ✗ No matches found for " << patternName << "\n";
       }
-      llvm::errs() << "  Value bindings: " << matches[i].valueBindings.size() << "\n";
     }
 
-    // ========== Extract matches to functions ==========
-    if (!matches.empty()) {
-      llvm::errs() << "\n========== EXTRACTING MATCHES TO FUNCTIONS ==========\n";
-
-      FunctionExtractor extractor;
-      OpBuilder builder(&getContext());
-
-      for (size_t i = 0; i < matches.size(); ++i) {
-        std::string funcName = patternInfo.name + "_" + std::to_string(i);
-        extractor.extractAndReplace(matches[i], patternInfo, funcName,
-                                     getOperation(), builder);
-      }
-
-      llvm::errs() << "=====================================================\n";
-    }
+    llvm::errs() << "**********************************************\n\n";
   }
 
-  llvm::errs() << "===========================================\n\n";
+  llvm::errs() << "============ ALL PATTERNS TESTED ============\n\n";
 
   // COMMENTED OUT: Old TransposeMulPattern - testing new pattern matcher instead
   // // First, apply the TransposeMulPattern as a greedy rewrite
