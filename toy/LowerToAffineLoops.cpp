@@ -526,6 +526,24 @@ LogicalResult parsePatternFile(StringRef filePath, MLIRContext *context,
 //===----------------------------------------------------------------------===//
 //===----------------------------------------------------------------------===//
 
+// Types of connections between pattern operations
+enum class ConnectionType {
+  RESULT_TO_INPUT,      // Parent op produces value used by child op (forward data flow)
+  INPUT_TO_RESULT,      // Child op uses value produced by parent op (backward data flow)
+  SHARED_INPUT          // Both ops use the same input value
+};
+
+// Connection between two pattern operations
+struct OpConnection {
+  size_t fromOpIdx;           // Index in patternOps (already matched op)
+  size_t toOpIdx;             // Index in patternOps (op being matched)
+  ConnectionType type;        // How they are connected
+  Value connectingValue;      // The value that connects them (in pattern IR)
+
+  OpConnection(size_t from, size_t to, ConnectionType t, Value val)
+      : fromOpIdx(from), toOpIdx(to), type(t), connectingValue(val) {}
+};
+
 // Structure to hold a single pattern match result
 struct PatternMatch {
   SmallVector<Operation*> matchedOps;     // Operations that matched
@@ -553,6 +571,9 @@ public:
           patternOps.push_back(&op);
         }
       }
+
+      // Build traversal order based on connectivity
+      buildTraversalOrder();
     }
   }
 
@@ -582,6 +603,10 @@ private:
   SmallVector<Operation*> patternOps;              // Pattern operations
   DenseMap<Value, Value> bindings;                 // Pattern value -> IR value
   SmallVector<Operation*> matchedOps;              // Currently matched ops
+
+  // Connectivity-based matching data structures
+  SmallVector<size_t> traversalOrder;              // Order to match ops (indices into patternOps)
+  DenseMap<size_t, OpConnection> parentConnection; // For each op index, how it connects to parent
 
   // Match a value, respecting existing bindings
   bool matchValue(Value patternVal, Value irVal) {
@@ -724,6 +749,133 @@ private:
     }
 
     return false;
+  }
+
+  // Build traversal order using BFS from the first pattern operation
+  // This establishes the order in which we'll match operations and
+  // records how each op connects to a previously-visited op
+  void buildTraversalOrder() {
+    if (patternOps.empty()) {
+      return;
+    }
+
+    // BFS queue: stores indices into patternOps
+    SmallVector<size_t> queue;
+    llvm::SmallDenseSet<size_t> visited;
+
+    // Start from the first operation
+    queue.push_back(0);
+    visited.insert(0);
+    traversalOrder.push_back(0);
+
+    size_t queueIdx = 0;
+    while (queueIdx < queue.size()) {
+      size_t currentIdx = queue[queueIdx++];
+      Operation *currentOp = patternOps[currentIdx];
+
+      // Forward search: Check each result value - is it consumed by an unvisited pattern op?
+      for (Value result : currentOp->getResults()) {
+        for (Operation *user : result.getUsers()) {
+          // Skip return operations
+          if (isa<func::ReturnOp>(user) || isa<toy::ReturnOp>(user)) {
+            continue;
+          }
+
+          // Find the index of this user in patternOps
+          auto it = std::find(patternOps.begin(), patternOps.end(), user);
+          if (it != patternOps.end()) {
+            size_t i = std::distance(patternOps.begin(), it);
+            if (!visited.contains(i)) {
+              // Found an unvisited pattern op connected via RESULT_TO_INPUT
+              visited.insert(i);
+              queue.push_back(i);
+              traversalOrder.push_back(i);
+
+              // Record the connection
+              parentConnection.try_emplace(
+                  i, OpConnection(currentIdx, i, ConnectionType::RESULT_TO_INPUT, result));
+
+              llvm::errs() << "[buildTraversalOrder] Forward: op " << currentIdx
+                          << " -> op " << i << " via RESULT_TO_INPUT\n";
+            }
+          }
+        }
+      }
+
+      // Backward search: Check each operand value
+      for (Value operand : currentOp->getOperands()) {
+        // Is it produced by an unvisited pattern op?
+        if (Operation *producer = operand.getDefiningOp()) {
+          auto it = std::find(patternOps.begin(), patternOps.end(), producer);
+          if (it != patternOps.end()) {
+            size_t i = std::distance(patternOps.begin(), it);
+            if (!visited.contains(i)) {
+              // Found an unvisited pattern op connected via INPUT_TO_RESULT
+              visited.insert(i);
+              queue.push_back(i);
+              traversalOrder.push_back(i);
+
+              // Record the connection
+              parentConnection.try_emplace(
+                  i, OpConnection(currentIdx, i, ConnectionType::INPUT_TO_RESULT, operand));
+
+              llvm::errs() << "[buildTraversalOrder] Backward: op " << currentIdx
+                          << " -> op " << i << " via INPUT_TO_RESULT\n";
+            }
+          }
+        }
+
+        // Is it also used by an unvisited pattern op (shared input)?
+        for (Operation *user : operand.getUsers()) {
+          if (user == currentOp) continue; // Skip current op itself
+
+          // Skip return operations
+          if (isa<func::ReturnOp>(user) || isa<toy::ReturnOp>(user)) {
+            continue;
+          }
+
+          auto it = std::find(patternOps.begin(), patternOps.end(), user);
+          if (it != patternOps.end()) {
+            size_t i = std::distance(patternOps.begin(), it);
+            if (!visited.contains(i)) {
+              // Found an unvisited pattern op connected via SHARED_INPUT
+              visited.insert(i);
+              queue.push_back(i);
+              traversalOrder.push_back(i);
+
+              // Record the connection
+              parentConnection.try_emplace(
+                  i, OpConnection(currentIdx, i, ConnectionType::SHARED_INPUT, operand));
+
+              llvm::errs() << "[buildTraversalOrder] Shared input: op " << currentIdx
+                          << " -> op " << i << " via SHARED_INPUT\n";
+            }
+          }
+        }
+      }
+    }
+
+    // Verify connectivity: all ops must be visited
+    if (traversalOrder.size() != patternOps.size()) {
+      llvm::errs() << "ERROR: Pattern has disconnected operations!\n";
+      llvm::errs() << "  Visited " << traversalOrder.size() << " ops out of "
+                   << patternOps.size() << " total\n";
+      llvm::errs() << "  Visited ops:";
+      for (size_t idx : traversalOrder) {
+        llvm::errs() << " " << idx;
+      }
+      llvm::errs() << "\n";
+
+      // Clear the data structures to indicate failure
+      traversalOrder.clear();
+      parentConnection.clear();
+    } else {
+      llvm::errs() << "[buildTraversalOrder] Successfully built traversal order: ";
+      for (size_t idx : traversalOrder) {
+        llvm::errs() << idx << " ";
+      }
+      llvm::errs() << "\n";
+    }
   }
 };
 
