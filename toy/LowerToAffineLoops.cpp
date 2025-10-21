@@ -608,6 +608,78 @@ private:
   SmallVector<size_t> traversalOrder;              // Order to match ops (indices into patternOps)
   DenseMap<size_t, OpConnection> parentConnection; // For each op index, how it connects to parent
 
+  // Helper function: Get users of a value sorted by IR order
+  // This ensures deterministic matching behavior
+  SmallVector<Operation*> getSortedUsers(Value value) {
+    SmallVector<Operation*> users;
+    for (Operation *user : value.getUsers()) {
+      users.push_back(user);
+    }
+
+    // Sort by IR order using isBeforeInBlock
+    std::sort(users.begin(), users.end(), [](Operation *a, Operation *b) {
+      // If in same block, use isBeforeInBlock
+      if (a->getBlock() == b->getBlock()) {
+        return a->isBeforeInBlock(b);
+      }
+      // Different blocks - use pointer comparison for determinism
+      return a < b;
+    });
+
+    return users;
+  }
+
+  // Find candidate IR operations connected to a matched IR op in the same way
+  // as specified by the pattern connection
+  SmallVector<Operation*> findConnectedCandidates(const OpConnection &conn,
+                                                   Operation *matchedIROp) {
+    SmallVector<Operation*> candidates;
+
+    // Look up the IR value corresponding to the pattern's connecting value
+    auto it = bindings.find(conn.connectingValue);
+    if (it == bindings.end()) {
+      // Connecting value not yet bound - this shouldn't happen in correct traversal order
+      llvm::errs() << "[findConnectedCandidates] ERROR: Connecting value not bound!\n";
+      return candidates;
+    }
+
+    Value irValue = it->second;
+
+    switch (conn.type) {
+    case ConnectionType::RESULT_TO_INPUT: {
+      // Forward data flow: find operations that consume this value
+      // Pattern: parentOp -> result -> used by childOp
+      candidates = getSortedUsers(irValue);
+      llvm::errs() << "[findConnectedCandidates] RESULT_TO_INPUT: found "
+                   << candidates.size() << " consumers\n";
+      break;
+    }
+
+    case ConnectionType::INPUT_TO_RESULT: {
+      // Backward data flow: find the operation that produces this value
+      // Pattern: childOp uses value <- produced by parentOp
+      if (Operation *producer = irValue.getDefiningOp()) {
+        candidates.push_back(producer);
+        llvm::errs() << "[findConnectedCandidates] INPUT_TO_RESULT: found 1 producer\n";
+      } else {
+        llvm::errs() << "[findConnectedCandidates] INPUT_TO_RESULT: value is block argument, no producer\n";
+      }
+      break;
+    }
+
+    case ConnectionType::SHARED_INPUT: {
+      // Shared input: find all operations that use the same value
+      // Pattern: both ops use the same input value
+      candidates = getSortedUsers(irValue);
+      llvm::errs() << "[findConnectedCandidates] SHARED_INPUT: found "
+                   << candidates.size() << " users\n";
+      break;
+    }
+    }
+
+    return candidates;
+  }
+
   // Match a value, respecting existing bindings
   bool matchValue(Value patternVal, Value irVal) {
     // Check if this pattern value is already bound
