@@ -583,15 +583,22 @@ public:
 
     // Walk all operations in the module
     module.walk([&](Operation *op) {
-      // Try to match starting from this operation
-      bindings.clear();
-      matchedOps.clear();
-
-      if (matchSequence(op, 0)) {
+      // Try to match starting from this operation using NEW connectivity-based algorithm
+      if (matchConnectedSequence(op)) {
         PatternMatch match(op->getLoc());
-        match.matchedOps = matchedOps;
+
+        // Convert indexed matchedOps to flat vector (skip nullptrs)
+        for (Operation *matchedOp : matchedOps) {
+          if (matchedOp) {
+            match.matchedOps.push_back(matchedOp);
+          }
+        }
+
         match.valueBindings = bindings;
         matches.push_back(match);
+
+        llvm::errs() << "[findMatches] Found match with " << match.matchedOps.size()
+                     << " operations\n";
       }
     });
 
@@ -693,6 +700,7 @@ private:
   }
 
   // Match a single operation
+  // This checks operation name, operand count, result count, and binds all operands and results
   bool matchOp(Operation *patternOp, Operation *irOp) {
     // Match operation name (ignore types)
     if (patternOp->getName() != irOp->getName()) {
@@ -732,6 +740,11 @@ private:
       return false;
     }
 
+    // Match result count
+    if (patternOp->getNumResults() != irOp->getNumResults()) {
+      return false;
+    }
+
     // Match operands (with SSA binding)
     for (auto [patternOperand, irOperand] :
          llvm::zip(patternOp->getOperands(), irOp->getOperands())) {
@@ -740,10 +753,120 @@ private:
       }
     }
 
+    // Match results (with SSA binding)
+    for (auto [patternResult, irResult] :
+         llvm::zip(patternOp->getResults(), irOp->getResults())) {
+      if (!matchValue(patternResult, irResult)) {
+        return false;
+      }
+    }
+
     return true;
   }
 
+  // NEW: Connectivity-based matching using traversal order
   // Match all pattern operations starting from a candidate operation
+  bool matchConnectedSequence(Operation *startOp) {
+    // If traversal order wasn't built (disconnected pattern), fail
+    if (traversalOrder.empty()) {
+      return false;
+    }
+
+    // Clear state
+    bindings.clear();
+    matchedOps.clear();
+    matchedOps.resize(patternOps.size(), nullptr); // Use indexed storage
+
+    // Match the first operation (traversalOrder[0] should be 0)
+    // matchOp will bind all operands and results
+    Operation *firstPatternOp = patternOps[traversalOrder[0]];
+    if (!matchOp(firstPatternOp, startOp)) {
+      return false;
+    }
+
+    // Record the match
+    matchedOps[traversalOrder[0]] = startOp;
+
+    llvm::errs() << "[matchConnectedSequence] Matched first op at index "
+                 << traversalOrder[0] << "\n";
+
+    // Match remaining operations in traversal order
+    return matchRemainingConnected(1);
+  }
+
+  // Recursively match remaining operations using connectivity
+  bool matchRemainingConnected(size_t traversalIdx) {
+    if (traversalIdx >= traversalOrder.size()) {
+      return true; // All matched!
+    }
+
+    size_t patternIdx = traversalOrder[traversalIdx];
+    Operation *patternOp = patternOps[patternIdx];
+
+    llvm::errs() << "[matchRemainingConnected] Matching pattern op " << patternIdx
+                 << " (traversal idx " << traversalIdx << ")\n";
+
+    // Get the parent connection for this op
+    auto connIt = parentConnection.find(patternIdx);
+    if (connIt == parentConnection.end()) {
+      llvm::errs() << "[matchRemainingConnected] ERROR: No parent connection for op "
+                   << patternIdx << "\n";
+      return false;
+    }
+
+    const OpConnection &conn = connIt->second;
+    Operation *parentIROp = matchedOps[conn.fromOpIdx];
+
+    if (!parentIROp) {
+      llvm::errs() << "[matchRemainingConnected] ERROR: Parent op not matched!\n";
+      return false;
+    }
+
+    // Find candidate operations connected in the same way
+    SmallVector<Operation*> candidates = findConnectedCandidates(conn, parentIROp);
+
+    llvm::errs() << "[matchRemainingConnected] Found " << candidates.size()
+                 << " candidates\n";
+
+    // Try each candidate with backtracking
+    for (Operation *candidate : candidates) {
+      // Skip if already matched
+      if (std::find(matchedOps.begin(), matchedOps.end(), candidate) != matchedOps.end()) {
+        llvm::errs() << "[matchRemainingConnected] Skipping already-matched candidate\n";
+        continue;
+      }
+
+      // Save bindings for backtracking (deep copy)
+      DenseMap<Value, Value> savedBindings = bindings;
+
+      // Try to match this candidate (matchOp will bind operands and results)
+      if (!matchOp(patternOp, candidate)) {
+        llvm::errs() << "[matchRemainingConnected] matchOp failed\n";
+        // Restore bindings since matchOp may have partially modified them
+        bindings = savedBindings;
+        continue;
+      }
+
+      // Record the match
+      matchedOps[patternIdx] = candidate;
+
+      llvm::errs() << "[matchRemainingConnected] Successfully matched, recursing...\n";
+
+      // Recursively match remaining operations
+      if (matchRemainingConnected(traversalIdx + 1)) {
+        return true; // Success!
+      }
+
+      // Backtrack: undo this match and restore bindings
+      llvm::errs() << "[matchRemainingConnected] Backtracking...\n";
+      matchedOps[patternIdx] = nullptr;
+      bindings = savedBindings;
+    }
+
+    return false; // All candidates failed
+  }
+
+  // OLD: Match all pattern operations starting from a candidate operation
   // This handles DAG patterns by matching based on data dependencies
   bool matchSequence(Operation *startOp, size_t patternIndex) {
     if (patternIndex >= patternOps.size()) {
