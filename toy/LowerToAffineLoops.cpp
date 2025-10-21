@@ -555,7 +555,8 @@ struct PatternMatch {
 
 class PatternMatcher {
 public:
-  PatternMatcher(PatternInfo &pattern) : pattern(pattern) {
+  PatternMatcher(PatternInfo &pattern, DenseSet<Operation*> &globalMatched)
+      : pattern(pattern), globalMatchedOps(globalMatched) {
     // Get the pattern function to access its operations
     toy::FuncOp patternFunc = nullptr;
     pattern.patternModule->walk([&](toy::FuncOp func) {
@@ -583,14 +584,21 @@ public:
 
     // Walk all operations in the module
     module.walk([&](Operation *op) {
+      // Skip if this operation is already part of a previous match
+      if (globalMatchedOps.contains(op)) {
+        return;
+      }
+
       // Try to match starting from this operation using NEW connectivity-based algorithm
       if (matchConnectedSequence(op)) {
         PatternMatch match(op->getLoc());
 
         // Convert indexed matchedOps to flat vector (skip nullptrs)
+        // and add to global matched set
         for (Operation *matchedOp : matchedOps) {
           if (matchedOp) {
             match.matchedOps.push_back(matchedOp);
+            globalMatchedOps.insert(matchedOp);
           }
         }
 
@@ -614,6 +622,9 @@ private:
   // Connectivity-based matching data structures
   SmallVector<size_t> traversalOrder;              // Order to match ops (indices into patternOps)
   DenseMap<size_t, OpConnection> parentConnection; // For each op index, how it connects to parent
+
+  // Global set of operations already matched (shared across all pattern matches)
+  DenseSet<Operation*> &globalMatchedOps;
 
   // Helper function: Get users of a value sorted by IR order
   // This ensures deterministic matching behavior
@@ -830,9 +841,15 @@ private:
 
     // Try each candidate with backtracking
     for (Operation *candidate : candidates) {
-      // Skip if already matched
+      // Skip if already matched in current pattern
       if (std::find(matchedOps.begin(), matchedOps.end(), candidate) != matchedOps.end()) {
-        llvm::errs() << "[matchRemainingConnected] Skipping already-matched candidate\n";
+        llvm::errs() << "[matchRemainingConnected] Skipping already-matched candidate (current pattern)\n";
+        continue;
+      }
+
+      // Skip if already matched globally (in a previous pattern match)
+      if (globalMatchedOps.contains(candidate)) {
+        llvm::errs() << "[matchRemainingConnected] Skipping already-matched candidate (global)\n";
         continue;
       }
 
@@ -1254,6 +1271,9 @@ void ToyToAffineLoweringPass::runOnOperation() {
     {"transpose_mul_add", "patterns/transpose_mul_add.mlir"}
   };
 
+  // Global set to track operations already matched across all patterns
+  DenseSet<Operation*> globalMatchedOps;
+
   // Try each pattern
   for (auto &[patternName, patternPath] : patternFiles) {
     PatternInfo patternInfo;
@@ -1267,7 +1287,7 @@ void ToyToAffineLoweringPass::runOnOperation() {
     patternInfo.dump();
 
     if (patternInfo.patternModule) {
-      PatternMatcher matcher(patternInfo);
+      PatternMatcher matcher(patternInfo, globalMatchedOps);
       SmallVector<PatternMatch> matches = matcher.findMatches(getOperation());
 
       llvm::errs() << "  Found " << matches.size() << " match(es)\n";
