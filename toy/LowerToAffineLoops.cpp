@@ -604,9 +604,6 @@ public:
 
         match.valueBindings = bindings;
         matches.push_back(match);
-
-        llvm::errs() << "[findMatches] Found match with " << match.matchedOps.size()
-                     << " operations\n";
       }
     });
 
@@ -657,7 +654,6 @@ private:
     auto it = bindings.find(conn.connectingValue);
     if (it == bindings.end()) {
       // Connecting value not yet bound - this shouldn't happen in correct traversal order
-      llvm::errs() << "[findConnectedCandidates] ERROR: Connecting value not bound!\n";
       return candidates;
     }
 
@@ -668,8 +664,6 @@ private:
       // Forward data flow: find operations that consume this value
       // Pattern: parentOp -> result -> used by childOp
       candidates = getSortedUsers(irValue);
-      llvm::errs() << "[findConnectedCandidates] RESULT_TO_INPUT: found "
-                   << candidates.size() << " consumers\n";
       break;
     }
 
@@ -678,9 +672,6 @@ private:
       // Pattern: childOp uses value <- produced by parentOp
       if (Operation *producer = irValue.getDefiningOp()) {
         candidates.push_back(producer);
-        llvm::errs() << "[findConnectedCandidates] INPUT_TO_RESULT: found 1 producer\n";
-      } else {
-        llvm::errs() << "[findConnectedCandidates] INPUT_TO_RESULT: value is block argument, no producer\n";
       }
       break;
     }
@@ -689,8 +680,6 @@ private:
       // Shared input: find all operations that use the same value
       // Pattern: both ops use the same input value
       candidates = getSortedUsers(irValue);
-      llvm::errs() << "[findConnectedCandidates] SHARED_INPUT: found "
-                   << candidates.size() << " users\n";
       break;
     }
     }
@@ -798,9 +787,6 @@ private:
     // Record the match
     matchedOps[traversalOrder[0]] = startOp;
 
-    llvm::errs() << "[matchConnectedSequence] Matched first op at index "
-                 << traversalOrder[0] << "\n";
-
     // Match remaining operations in traversal order
     return matchRemainingConnected(1);
   }
@@ -814,14 +800,9 @@ private:
     size_t patternIdx = traversalOrder[traversalIdx];
     Operation *patternOp = patternOps[patternIdx];
 
-    llvm::errs() << "[matchRemainingConnected] Matching pattern op " << patternIdx
-                 << " (traversal idx " << traversalIdx << ")\n";
-
     // Get the parent connection for this op
     auto connIt = parentConnection.find(patternIdx);
     if (connIt == parentConnection.end()) {
-      llvm::errs() << "[matchRemainingConnected] ERROR: No parent connection for op "
-                   << patternIdx << "\n";
       return false;
     }
 
@@ -829,27 +810,21 @@ private:
     Operation *parentIROp = matchedOps[conn.fromOpIdx];
 
     if (!parentIROp) {
-      llvm::errs() << "[matchRemainingConnected] ERROR: Parent op not matched!\n";
       return false;
     }
 
     // Find candidate operations connected in the same way
     SmallVector<Operation*> candidates = findConnectedCandidates(conn, parentIROp);
 
-    llvm::errs() << "[matchRemainingConnected] Found " << candidates.size()
-                 << " candidates\n";
-
     // Try each candidate with backtracking
     for (Operation *candidate : candidates) {
       // Skip if already matched in current pattern
       if (std::find(matchedOps.begin(), matchedOps.end(), candidate) != matchedOps.end()) {
-        llvm::errs() << "[matchRemainingConnected] Skipping already-matched candidate (current pattern)\n";
         continue;
       }
 
       // Skip if already matched globally (in a previous pattern match)
       if (globalMatchedOps.contains(candidate)) {
-        llvm::errs() << "[matchRemainingConnected] Skipping already-matched candidate (global)\n";
         continue;
       }
 
@@ -858,7 +833,6 @@ private:
 
       // Try to match this candidate (matchOp will bind operands and results)
       if (!matchOp(patternOp, candidate)) {
-        llvm::errs() << "[matchRemainingConnected] matchOp failed\n";
         // Restore bindings since matchOp may have partially modified them
         bindings = savedBindings;
         continue;
@@ -867,15 +841,12 @@ private:
       // Record the match
       matchedOps[patternIdx] = candidate;
 
-      llvm::errs() << "[matchRemainingConnected] Successfully matched, recursing...\n";
-
       // Recursively match remaining operations
       if (matchRemainingConnected(traversalIdx + 1)) {
         return true; // Success!
       }
 
       // Backtrack: undo this match and restore bindings
-      llvm::errs() << "[matchRemainingConnected] Backtracking...\n";
       matchedOps[patternIdx] = nullptr;
       bindings = savedBindings;
     }
@@ -926,9 +897,6 @@ private:
               // Record the connection
               parentConnection.try_emplace(
                   i, OpConnection(currentIdx, i, ConnectionType::RESULT_TO_INPUT, result));
-
-              llvm::errs() << "[buildTraversalOrder] Forward: op " << currentIdx
-                          << " -> op " << i << " via RESULT_TO_INPUT\n";
             }
           }
         }
@@ -950,9 +918,6 @@ private:
               // Record the connection
               parentConnection.try_emplace(
                   i, OpConnection(currentIdx, i, ConnectionType::INPUT_TO_RESULT, operand));
-
-              llvm::errs() << "[buildTraversalOrder] Backward: op " << currentIdx
-                          << " -> op " << i << " via INPUT_TO_RESULT\n";
             }
           }
         }
@@ -978,9 +943,6 @@ private:
               // Record the connection
               parentConnection.try_emplace(
                   i, OpConnection(currentIdx, i, ConnectionType::SHARED_INPUT, operand));
-
-              llvm::errs() << "[buildTraversalOrder] Shared input: op " << currentIdx
-                          << " -> op " << i << " via SHARED_INPUT\n";
             }
           }
         }
@@ -1001,12 +963,6 @@ private:
       // Clear the data structures to indicate failure
       traversalOrder.clear();
       parentConnection.clear();
-    } else {
-      llvm::errs() << "[buildTraversalOrder] Successfully built traversal order: ";
-      for (size_t idx : traversalOrder) {
-        llvm::errs() << idx << " ";
-      }
-      llvm::errs() << "\n";
     }
   }
 };
