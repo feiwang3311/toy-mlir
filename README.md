@@ -89,10 +89,10 @@ toy.func @pattern(%arg0: tensor<2x3xf64>) -> tensor<3x2xf64> {
 }
 ```
 
-### PART 2: Pattern Matching
-**Location:** `toy/LowerToAffineLoops.cpp` (Lines 512-722)
+### PART 2: Pattern Matching (Connectivity-Based Algorithm)
+**Location:** `toy/LowerToAffineLoops.cpp` (Lines 512-867)
 
-Implements SSA value binding algorithm to find pattern matches in IR.
+Implements a **connectivity-based pattern matching algorithm** with SSA value binding to efficiently find pattern matches in IR.
 
 **📖 For a detailed deep-dive explanation of this part, see [PATTERN_MATCHING_EXPLAINED.md](PATTERN_MATCHING_EXPLAINED.md)**
 
@@ -100,14 +100,38 @@ Implements SSA value binding algorithm to find pattern matches in IR.
 - **SSA Value Binding:** Pattern values consistently map to IR values (supports multi-result operations)
 - **DAG Pattern Support:** Handles values used multiple times (not just linear chains)
 - **Call Prefix Matching:** Pattern `@foo` matches `@foo_0`, `@foo_1`, etc.
-- **Backtracking Search:** Finds all non-overlapping matches
+- **Connectivity-Based Search:** Only searches operations connected via data flow (massive speedup)
+- **Backtracking with Deep Copy:** Proper state restoration during backtracking
 
-**Matching Algorithm:**
+**Algorithm Overview (3 Phases):**
+
+**Phase 1: Pattern Analysis (buildTraversalOrder)**
+- Use BFS from first pattern operation to explore connectivity
+- Build traversal order based on how operations are connected
+- Verify pattern is fully connected (all ops reachable)
+- Record parent connections for each operation
+
+**Phase 2: Connection-Based Candidate Search**
+- For each pattern operation, find IR candidates via connections:
+  - **RESULT_TO_INPUT:** Find consumers of a value (`value.getUsers()`)
+  - **INPUT_TO_RESULT:** Find producer of a value (`value.getDefiningOp()`)
+  - **SHARED_INPUT:** Find all users of a shared value
+- Sort users deterministically by IR order for consistent matching
+
+**Phase 3: Connectivity-Based Matching**
 1. Walk all operations in the module
-2. For each operation, try to match the first pattern operation
-3. Use data-flow based search to match remaining operations
-4. Bind SSA values consistently (same pattern value → same IR value, handles multiple results)
-5. Backtrack if constraints violated
+2. Match first pattern operation against each IR operation
+3. For remaining ops (in traversal order):
+   - Use parent connection to find candidates (only connected ops!)
+   - Try each candidate with backtracking
+   - Deep copy bindings before each attempt
+   - Restore bindings on failure
+4. Return all non-overlapping matches
+
+**Performance Improvement:**
+- **Old algorithm:** O(N^P) where N = IR size, P = pattern size
+- **New algorithm:** O(C^P) where C = avg connected ops (typically 2-10)
+- **Speedup:** For N=1000, C=5, P=5 → ~10^11x faster (theoretical)
 
 ### PART 3: Function Transformations
 **Location:** `toy/LowerToAffineLoops.cpp` (Lines 724-914)
@@ -218,6 +242,10 @@ toy.func @pattern(%arg0: tensor<2x3xf64>, %arg1: tensor<3x2xf64>) -> tensor<3x2x
 | **Prefix matching for calls** | Enable composable patterns (@foo matches @foo_N) |
 | **Automatic inlining** | Avoid nested calls, produce flat functions |
 | **Dead function elimination** | Keep IR clean after composition |
+| **Connectivity-based search** | Only search connected ops instead of all IR ops (huge speedup) |
+| **BFS traversal order** | Establish parent connections, each op needs only one connection |
+| **Deep copy for backtracking** | Simple and robust state restoration vs. incremental tracking |
+| **Sorted users (isBeforeInBlock)** | Deterministic matching behavior, reproducible results |
 
 ## Files Modified/Added
 
